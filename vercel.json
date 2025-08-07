@@ -3,6 +3,10 @@
     {
       "src": "/api/ngram_entity_analysis",
       "dest": "/api/index.py"
+    },
+    {
+      "src": "/api/keyword_validator",
+      "dest": "/api/keyword_validator.py"
     }
   ]
 }
