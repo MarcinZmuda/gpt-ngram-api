@@ -1,2 +1,2 @@
 # requirements.txt
-# Brak dodatkowych zależności
+langextract
