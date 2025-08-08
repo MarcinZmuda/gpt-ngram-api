@@ -1,35 +1,25 @@
-# api/keyword_validator.py
+# api/keyword_validator.py --- WERSJA UPROSZCZONA BEZ SPACY ---
 from http.server import BaseHTTPRequestHandler
 import json
-import spacy
 
-# Ładujemy polski model językowy RAZ, przy starcie funkcji, aby działała szybciej.
-nlp = spacy.load("pl_core_news_sm")
+def simple_counter(data):
+    # Oczekuje już zlematyzowanego tekstu i słów kluczowych
+    lemmatized_text = data.get('lemmatized_text', '')
+    lemmatized_keywords = data.get('lemmatized_keywords', [])
 
-def validate_keywords_with_lemmatization(data):
-    text_to_analyze = data.get('text', '')
-    keywords_to_track = data.get('keywords_to_track', [])
-
-    if not text_to_analyze or not keywords_to_track:
-        return {"error": "Missing text or keywords_to_track"}
-
-    # Lematyzujemy cały tekst wejściowy
-    doc = nlp(text_to_analyze.lower())
-    lemmatized_text = " ".join([token.lemma_ for token in doc])
+    if not lemmatized_text or not lemmatized_keywords:
+        return {"error": "Missing lemmatized text or keywords"}
 
     results = {}
-    for keyword in keywords_to_track:
-        # Lematyzujemy każde słowo kluczowe
-        keyword_doc = nlp(keyword.lower())
-        lemmatized_keyword = " ".join([token.lemma_ for token in keyword_doc])
-        
-        # Zliczamy wystąpienia zlematyzowanej frazy w zlematyzowanym tekście
-        count = lemmatized_text.count(lemmatized_keyword)
+    for keyword in lemmatized_keywords:
+        # Proste zliczanie, bo cała magia stała się już wcześniej
+        count = lemmatized_text.count(keyword)
         results[keyword] = count
 
     return {"keyword_counts": results}
 
 class handler(BaseHTTPRequestHandler):
+    # Tutaj wklej resztę kodu handlera (z CORS), jest taki sam jak poprzednio
     def _set_cors_headers(self):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
@@ -43,11 +33,9 @@ class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         content_length = int(self.headers.get('Content-Length', 0))
         post_data = self.rfile.read(content_length)
-        
         try:
             input_data = json.loads(post_data)
-            response_data = validate_keywords_with_lemmatization(input_data)
-            
+            response_data = simple_counter(input_data)
             self.send_response(200)
             self._set_cors_headers()
             self.end_headers()
@@ -57,5 +45,4 @@ class handler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({'error': str(e)}).encode('utf-8'))
-        
         return
