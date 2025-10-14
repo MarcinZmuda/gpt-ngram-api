@@ -4,30 +4,34 @@ import json
 import spacy
 from http.server import BaseHTTPRequestHandler
 
-# Ładujemy model spaCy tylko raz przy starcie serwera (optymalizacja)
+# Ładujemy model spaCy tylko raz przy starcie serwera
 try:
     NLP = spacy.load("pl_core_news_sm")
 except OSError:
-    # Ten blok jest na wypadek, gdyby model nie był zainstalowany lokalnie.
-    # Na Vercel zostanie zainstalowany z requirements.txt.
     from spacy.cli import download
     download("pl_core_news_sm")
     NLP = spacy.load("pl_core_news_sm")
 
-class handler(BaseHTTPRequestHandler):
+def lemmatize_text(text):
+    """Zwraca listę lematów z tekstu (bez znaków interpunkcyjnych)."""
+    doc = NLP(text.lower())
+    return [token.lemma_ for token in doc if token.is_alpha]
 
-    def do_OPTIONS(self):
-        self.send_response(200, "ok")
+class handler(BaseHTTPRequestHandler):
+    def _set_headers(self):
         self.send_header('Access-Control-Allow-Origin', 'https://chat.openai.com')
         self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+
+    def do_OPTIONS(self):
+        self.send_response(200, "ok")
+        self._set_headers()
         self.end_headers()
-        return
 
     def do_POST(self):
         content_length = int(self.headers['Content-Length'])
         post_data = self.rfile.read(content_length)
-        
+
         try:
             data = json.loads(post_data)
             text_to_process = data.get("text")
@@ -36,34 +40,36 @@ class handler(BaseHTTPRequestHandler):
             if not text_to_process or not isinstance(keywords_to_find, list):
                 raise ValueError("Missing 'text' or 'keywords' parameter.")
 
-            # Lematyzacja tekstu
-            doc_text = NLP(text_to_process.lower())
-            text_lemmas = {token.lemma_ for token in doc_text}
+            # Lematyzujemy cały tekst (lista lematów)
+            text_lemmas = lemmatize_text(text_to_process)
 
-            # Lematyzacja słów kluczowych i zliczanie
             keyword_counts = {}
+
             for keyword in keywords_to_find:
-                doc_kw = NLP(keyword.lower())
-                # Bierzemy tylko pierwszy, najważniejszy lemat frazy
-                kw_lemma = doc_kw[0].lemma_
-                
-                # Zliczamy wystąpienia lematu
-                count = sum(1 for token in doc_text if token.lemma_ == kw_lemma)
+                # Lematyzacja frazy kluczowej
+                keyword_lemmas = lemmatize_text(keyword)
+                kw_len = len(keyword_lemmas)
+                count = 0
+
+                # Przesuwamy się po tekście i sprawdzamy pełne dopasowania sekwencji
+                for i in range(len(text_lemmas) - kw_len + 1):
+                    if text_lemmas[i:i + kw_len] == keyword_lemmas:
+                        count += 1
+
                 keyword_counts[keyword] = count
 
+            # Wysyłamy odpowiedź
             self.send_response(200)
+            self._set_headers()
             self.send_header('Content-type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', 'https://chat.openai.com')
             self.end_headers()
             response_data = json.dumps({"keyword_counts": keyword_counts})
             self.wfile.write(response_data.encode('utf-8'))
 
         except Exception as e:
             self.send_response(400)
+            self._set_headers()
             self.send_header('Content-type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', 'https://chat.openai.com')
             self.end_headers()
             error_response = json.dumps({"error": str(e)})
             self.wfile.write(error_response.encode('utf-8'))
-        
-        return
