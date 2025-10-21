@@ -1,16 +1,19 @@
 {
   "builds": [
-    { "src": "api/*.py", "use": "@vercel/python" }
+    {
+      "src": "api/index.py",
+      "use": "@vercel/python"
+    }
   ],
   "routes": [
-    { "src": "/api/s1_analysis", "dest": "/api/index.py" },
-    { "src": "/api/ngram_entity_analysis", "dest": "/api/index.py" },
-    { "src": "/api/analyze_headings", "dest": "/api/analyze_headings.py" },
-    { "src": "/api/synthesize_topics", "dest": "/api/synthesize_topics.py" },
-    { "src": "/api/keyword_validator", "dest": "/api/keyword_validator.py" },
-    { "src": "/api/generate_compliance_report", "dest": "/api/generate_compliance_report.py" },
-    { "src": "/api/advanced_keyword_verifier", "dest": "/api/advanced_keyword_verifier.py" },
-    { "src": "/api/hierarchical_keyword_counter", "dest": "/api/hierarchical_keyword_counter.py" },
-    { "src": "/api/health", "dest": "/api/index.py" }
+    { "src": "/api/ngram_entity_analysis", "dest": "api/index.py" },
+    { "src": "/api/analyze_headings", "dest": "api/analyze_headings.py" },
+    { "src": "/api/synthesize_topics", "dest": "api/synthesize_topics.py" },
+    { "src": "/api/generate_compliance_report", "dest": "api/generate_compliance_report.py" },
+    { "src": "/api/keyword_validator", "dest": "api/keyword_validator.py" },
+    { "src": "/api/hierarchical_keyword_counter", "dest": "api/hierarchical_keyword_counter.py" },
+    { "src": "/api/health", "dest": "api/index.py" },
+    { "src": "/(.*)", "dest": "api/index.py" }
   ]
 }
+
