@@ -1,32 +1,36 @@
-# Plik: api/analyze_headings.py
-import json
 from collections import Counter
-from http.server import BaseHTTPRequestHandler
 
-class handler(BaseHTTPRequestHandler):
-    def do_OPTIONS(self):
-        self.send_response(200, "ok")
-        self.send_header('Access-Control-Allow-Origin', 'https://chat.openai.com')
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.end_headers()
-    def do_POST(self):
-        content_length = int(self.headers['Content-Length'])
-        post_data = self.rfile.read(content_length)
-        try:
-            data = json.loads(post_data)
-            headings = data.get("headings")
-            if not isinstance(headings, list): raise ValueError("Payload must include 'headings' (a list of strings).")
-            heading_counts = Counter(headings)
-            top_5_headings = [{"heading": h, "count": c} for h, c in heading_counts.most_common(5)]
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', 'https://chat.openai.com')
-            self.end_headers()
-            self.wfile.write(json.dumps({"top_headings": top_5_headings}).encode('utf-8'))
-        except Exception as e:
-            self.send_response(400)
-            self.send_header('Content-type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', 'https://chat.openai.com')
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+def analyze_headings(headings):
+    """
+    Analizuje listę nagłówków (np. H2, H3 itp.) i zwraca
+    5 najczęściej powtarzających się wraz z liczbą ich wystąpień.
+
+    Parametry:
+        headings (list): Lista nagłówków w formie tekstowej.
+
+    Zwraca:
+        dict: {
+            "top_headings": [
+                {"heading": "przykładowy nagłówek", "count": 3},
+                ...
+            ]
+        }
+        lub {"error": "..."} w przypadku nieprawidłowych danych.
+    """
+
+    # Walidacja wejścia
+    if not isinstance(headings, list):
+        return {"error": "Payload must include 'headings' as a list of strings."}
+
+    # Usunięcie pustych elementów i białych znaków
+    clean_headings = [h.strip() for h in headings if isinstance(h, str) and h.strip()]
+
+    # Zliczenie częstości wystąpień
+    heading_counts = Counter(clean_headings)
+
+    # Wybranie 5 najczęstszych
+    top_5_headings = [
+        {"heading": h, "count": c} for h, c in heading_counts.most_common(5)
+    ]
+
+    return {"top_headings": top_5_headings}
