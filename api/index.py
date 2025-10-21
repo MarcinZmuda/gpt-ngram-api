@@ -36,8 +36,8 @@ def perform_ngram_analysis():
     # --- Wykrywanie encji (entities) ---
     entities = list({ent.text for ent in doc.ents if len(ent.text) > 2})
 
-    # --- Tokenizacja + lematyzacja ---
-    tokens = [t.lemma_.lower() for t in doc if t.is_alpha and not t.is_stop]
+    # --- MODYFIKACJA: Tokenizacja Językowa (oryginalne słowa + stop-words) ---
+    tokens = [t.text.lower() for t in doc if t.is_alpha or t.is_stop]
 
     # --- Tworzenie n-gramów (2–4) ---
     ngram_results = {}
@@ -132,7 +132,7 @@ def root():
 def health_check():
     return jsonify({
         "status": "✅ API działa poprawnie",
-        "version": "v3.0.0",
+        "version": "v3.1.0-linguistic", # Zmieniona wersja dla jasności
         "message": "gpt-ngram-api-igyw online"
     }), 200
 
