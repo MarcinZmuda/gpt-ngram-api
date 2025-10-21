@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: gpt-ngram-api
+    env: python
+    region: frankfurt  # lub 'oregon' jeśli wolisz US
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 -b 0.0.0.0:5000 api.index:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
