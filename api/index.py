@@ -1,8 +1,8 @@
 from flask import Flask, request, jsonify
 from collections import Counter
 import spacy
-from synthesize_topics import synthesize_topics
-from generate_compliance_report import generate_compliance_report
+from .synthesize_topics import synthesize_topics
+from .generate_compliance_report import generate_compliance_report
 
 # ======================================================
 # 🌍 Inicjalizacja aplikacji Flask
