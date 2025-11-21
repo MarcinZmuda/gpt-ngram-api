@@ -6,3 +6,4 @@ spacy==3.7.2
 catalogue==2.0.10
 https://github.com/explosion/spacy-models/releases/download/pl_core_news_sm-3.7.0/pl_core_news_sm-3.7.0.tar.gz#egg=pl_core_news_sm
 gunicorn==21.2.0
+rapidfuzz==3.9.7
