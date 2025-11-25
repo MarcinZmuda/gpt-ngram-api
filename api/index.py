@@ -4,9 +4,18 @@ import spacy
 import re
 import os
 
-# --- KeyBERT + sentence-transformers ---
-from keybert import KeyBERT
-from sentence_transformers import SentenceTransformer
+# ======================================================
+# 🤖 Próba importu KeyBERT + SentenceTransformer (opcjonalne)
+# ======================================================
+try:
+    from keybert import KeyBERT
+    from sentence_transformers import SentenceTransformer
+    KEYBERT_AVAILABLE = True
+except ImportError:
+    KeyBERT = None
+    SentenceTransformer = None
+    KEYBERT_AVAILABLE = False
+    print("⚠️ KeyBERT / sentence-transformers not available – semantic keyphrases disabled.")
 
 # --- Importy lokalne ---
 try:
@@ -39,11 +48,15 @@ KEYBERT_MODEL_NAME = os.getenv(
     "paraphrase-multilingual-MiniLM-L12-v2"
 )
 
-try:
-    sentence_model = SentenceTransformer(KEYBERT_MODEL_NAME)
-    keybert = KeyBERT(model=sentence_model)
-except Exception as e:
-    print("⚠️ KeyBERT init error:", e)
+if KEYBERT_AVAILABLE:
+    try:
+        sentence_model = SentenceTransformer(KEYBERT_MODEL_NAME)
+        keybert = KeyBERT(model=sentence_model)
+    except Exception as e:
+        print("⚠️ KeyBERT init error:", e)
+        keybert = None
+        KEYBERT_AVAILABLE = False
+else:
     keybert = None
 
 
@@ -80,7 +93,7 @@ def perform_ngram_analysis():
 
         for n in range(2, 5):  # n-gramy 2,3,4
             for i in range(len(tokens) - n + 1):
-                ngram = " ".join(tokens[i:i+n])
+                ngram = " ".join(tokens[i:i + n])
                 ngram_freqs[ngram] += 1
                 ngram_presence[ngram].add(src["url"])
 
@@ -172,13 +185,14 @@ def perform_ngram_analysis():
             "total_sources": len(sources),
             "unique_ngrams": len(ngram_freqs),
             "context_used": bool(serp_context),
-            "sentence_model": KEYBERT_MODEL_NAME
+            "sentence_model": KEYBERT_MODEL_NAME,
+            "keybert_available": KEYBERT_AVAILABLE,
         }
     })
 
 
 # ======================================================
-# 🧩 2️⃣ Endpoint: synteza tematów (bez zmian)
+# 🧩 2️⃣ Endpoint: synteza tematów
 # ======================================================
 @app.route("/api/synthesize_topics", methods=["POST"])
 def perform_synthesize_topics():
@@ -190,7 +204,7 @@ def perform_synthesize_topics():
 
 
 # ======================================================
-# 🧩 3️⃣ Endpoint: raport licznika (bez zmian)
+# 🧩 3️⃣ Endpoint: raport licznika
 # ======================================================
 @app.route("/api/generate_compliance_report", methods=["POST"])
 def perform_generate_compliance_report():
@@ -219,7 +233,8 @@ def health_check():
     return jsonify({
         "status": "ok",
         "version": "v7.0-semantic",
-        "sentence_model": KEYBERT_MODEL_NAME
+        "sentence_model": KEYBERT_MODEL_NAME,
+        "keybert_available": KEYBERT_AVAILABLE,
     })
 
 
