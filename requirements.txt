@@ -1,31 +1,17 @@
-# --- FLASK + CORE ---
 Flask==3.0.3
 Flask-Cors==4.0.1
 requests==2.32.3
 python-dotenv==1.0.1
-gunicorn==21.2.0
 
-# --- spaCy PL ---
 spacy==3.7.2
 catalogue==2.0.10
 https://github.com/explosion/spacy-models/releases/download/pl_core_news_sm-3.7.0/pl_core_news_sm-3.7.0.tar.gz#egg=pl_core_news_sm
 
-# --- TOOLS / NLP ---
+gunicorn==21.2.0
 rapidfuzz==3.9.7
-textstat==0.7.4
-language-tool-python==2.7.0
-pysbd==0.3.4
-textdistance==4.6.0
 
-# --- SEMANTYKA / EMBEDDINGS / KEYBERT ---
+# --- Semantyka (KeyBERT + SentenceTransformer) ---
 keybert==0.8.5
 sentence-transformers==2.7.0
 transformers==4.41.2
 torch>=2.0.0
-numpy>=1.26.0
-
-# --- GOOGLE AI API (z wcześniejszej wersji) ---
-google-generativeai==0.3.2
-
-# --- Firebase (z wcześniejszych wymagań) ---
-firebase_admin==6.2.0
