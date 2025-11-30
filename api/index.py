@@ -1,37 +1,28 @@
-from flask import Flask, request, jsonify
-from collections import Counter, defaultdict
-import spacy
-import re
 import os
+import json
+import re
+from collections import Counter, defaultdict
+from flask import Flask, request, jsonify
+import spacy
+import google.generativeai as genai
 
-# ======================================================
-# 🤖 Próba importu KeyBERT + SentenceTransformer (opcjonalne)
-# ======================================================
-try:
-    from keybert import KeyBERT
-    from sentence_transformers import SentenceTransformer
-    KEYBERT_AVAILABLE = True
-except ImportError:
-    KeyBERT = None
-    SentenceTransformer = None
-    KEYBERT_AVAILABLE = False
-    print("⚠️ KeyBERT / sentence-transformers not available – semantic keyphrases disabled.")
+# --- Konfiguracja Gemini (Zastępstwo dla KeyBERT) ---
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
-# --- Importy lokalne ---
+# --- Importy lokalne (Poprawione z kropką dla struktury modułu) ---
 try:
     from .synthesize_topics import synthesize_topics
     from .generate_compliance_report import generate_compliance_report
 except ImportError:
+    # Fallback dla uruchamiania lokalnego poza pakietem
     from synthesize_topics import synthesize_topics
     from generate_compliance_report import generate_compliance_report
 
-
-# ======================================================
-# 🌍 Inicjalizacja aplikacji Flask
-# ======================================================
 app = Flask(__name__)
 
-# -------- spaCy PL --------
+# --- Ładowanie spaCy (Lekki model) ---
 try:
     nlp = spacy.load("pl_core_news_sm")
 except OSError:
@@ -41,202 +32,127 @@ except OSError:
 
 
 # ======================================================
-# 🤖 MODELE SEMANTYCZNE (KeyBERT / HerBERT)
+# 🧠 Helper: Semantyka przez Gemini (Cloud)
 # ======================================================
-KEYBERT_MODEL_NAME = os.getenv(
-    "KEYBERT_MODEL_NAME",
-    "paraphrase-multilingual-MiniLM-L12-v2"
-)
+def extract_semantic_tags_gemini(text, top_n=10):
+    """
+    Używa Google Gemini Flash do wyciągnięcia fraz semantycznych.
+    Zastępuje ciężkiego KeyBERT-a. Nie zużywa RAM-u.
+    """
+    if not GEMINI_API_KEY or not text.strip():
+        return []
 
-if KEYBERT_AVAILABLE:
     try:
-        sentence_model = SentenceTransformer(KEYBERT_MODEL_NAME)
-        keybert = KeyBERT(model=sentence_model)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        prompt = f"""
+        Jesteś ekspertem SEO. Przeanalizuj poniższy tekst i wypisz {top_n} najważniejszych fraz kluczowych (semantic keywords), które najlepiej oddają jego sens.
+        Zwróć TYLKO listę po przecinku, bez numerowania.
+        
+        TEKST: {text[:8000]}...
+        """
+        response = model.generate_content(prompt)
+        keywords = [k.strip() for k in response.text.split(",") if k.strip()]
+        
+        # Formatujemy tak jak stary KeyBERT: [{"phrase": x, "score": 0.9}]
+        # Dajemy sztuczny score, bo Gemini go nie zwraca, a frontend go lubi.
+        return [{"phrase": kw, "score": 0.95 - (i*0.02)} for i, kw in enumerate(keywords[:top_n])]
     except Exception as e:
-        print("⚠️ KeyBERT init error:", e)
-        keybert = None
-        KEYBERT_AVAILABLE = False
-else:
-    keybert = None
+        print(f"Gemini Semantic Error: {e}")
+        return []
 
 
 # ======================================================
-# 🧩 1️⃣ Endpoint: analiza n-gramów + encji + semantic keyphrases
+# 🧩 Endpoint: Analiza N-gramów + Semantyka Cloud
 # ======================================================
 @app.route("/api/ngram_entity_analysis", methods=["POST"])
 def perform_ngram_analysis():
     data = request.get_json()
-
     main_keyword = data.get("main_keyword", "")
     serp_context = data.get("serp_context", {})
-    text = data.get("text", "")
     sources = data.get("sources", [])
     top_n = int(data.get("top_n", 30))
 
-    if not text.strip() and not sources:
-        return jsonify({"error": "Brak tekstu lub źródeł do analizy"}), 400
-
-    # Jeśli dostajemy tylko tekst – zamieniamy na strukturę sources
     if not sources:
-        sources = [{"url": "input_text", "content": text}]
+        return jsonify({"error": "Brak źródeł do analizy"}), 400
 
-    # ======================================================
-    # 1. NLP → tokenizacja i ngramy 2–4
-    # ======================================================
+    # 1. NLP Statystyczne (N-gramy) - Lekkie, na CPU
     ngram_presence = defaultdict(set)
     ngram_freqs = Counter()
+    
+    # Łączymy tekst do analizy semantycznej
+    all_text_content = []
 
     for src in sources:
         content = src.get("content", "").lower()
-        doc = nlp(content)
+        all_text_content.append(src.get("content", ""))
+        
+        doc = nlp(content[:100000]) # Limit dla bezpieczeństwa RAM
         tokens = [t.text.lower() for t in doc if t.is_alpha]
 
-        for n in range(2, 5):  # n-gramy 2,3,4
+        for n in range(2, 5):
             for i in range(len(tokens) - n + 1):
                 ngram = " ".join(tokens[i:i + n])
                 ngram_freqs[ngram] += 1
-                ngram_presence[ngram].add(src["url"])
+                ngram_presence[ngram].add(src.get("url", "unknown"))
 
-    # Normalizacja częstotliwości
+    # Scoring N-gramów
     max_freq = max(ngram_freqs.values()) if ngram_freqs else 1
-
-    # ======================================================
-    # 2. Scoring (freq_norm + position_score + site_distribution)
-    # ======================================================
     results = []
+    
     for ngram, freq in ngram_freqs.items():
+        if freq < 2: continue # Ignorujemy unikaty
+        
         freq_norm = freq / max_freq
         site_score = len(ngram_presence[ngram]) / len(sources)
-
-        # position_score — jeśli ngram pojawia się w pierwszych 20% treści
-        position_score = 0
-        for src in sources:
-            content = src.get("content", "").lower()
-            pos = content.find(ngram)
-            if pos != -1 and pos < len(content) * 0.2:
-                position_score += 1
-        position_score = position_score / len(sources)
-
-        weight = round(freq_norm * 0.6 + position_score * 0.2 + site_score * 0.2, 4)
+        
+        # Prosta waga: częstotliwość + dystrybucja
+        weight = round(freq_norm * 0.5 + site_score * 0.5, 4)
+        
+        # Boost za słowo kluczowe
+        if main_keyword.lower() in ngram: weight += 0.1
 
         results.append({
             "ngram": ngram,
             "freq": freq,
-            "freq_norm": round(freq_norm, 3),
-            "position_score": round(position_score, 3),
-            "site_distribution": f"{len(ngram_presence[ngram])}/{len(sources)}",
-            "site_distribution_score": round(site_score, 3),
-            "weight": weight
+            "weight": min(1.0, weight),
+            "site_distribution": f"{len(ngram_presence[ngram])}/{len(sources)}"
         })
 
-    # ======================================================
-    # 3. Encje globalne
-    # ======================================================
-    all_text = " ".join(s["content"] for s in sources)
-    doc_global = nlp(all_text)
-    entities = list({ent.text for ent in doc_global.ents if len(ent.text) > 2})
-
-    # ======================================================
-    # 4. Semantic Keyphrases (KeyBERT / HerBERT)
-    # ======================================================
-    semantic_keyphrases = []
-    if keybert and all_text.strip():
-        try:
-            phrases = keybert.extract_keywords(
-                all_text,
-                keyphrase_ngram_range=(1, 4),
-                stop_words=None,
-                use_mmr=True,
-                diversity=0.6,
-                top_n=top_n
-            )
-            semantic_keyphrases = [
-                {"phrase": p[0], "score": float(p[1])}
-                for p in phrases
-            ]
-        except Exception as e:
-            print("⚠️ KeyBERT extraction error:", e)
-
-    # ======================================================
-    # 5. SERP context boost
-    # ======================================================
-    serp_blob = " ".join([
-        " ".join(serp_context.get("people_also_ask", [])),
-        " ".join(serp_context.get("related_searches", [])),
-        " ".join(serp_context.get("featured_snippets", [])),
-    ]).lower()
-
-    for r in results:
-        boost = 0.0
-        if main_keyword.lower() in r["ngram"]:
-            boost += 0.05
-        if r["ngram"] in serp_blob:
-            boost += 0.05
-        r["weight"] = round(min(1.0, r["weight"] + boost), 4)
-
+    # Sortowanie N-gramów
     results = sorted(results, key=lambda x: x["weight"], reverse=True)[:top_n]
+
+    # 2. Semantyka w Chmurze (Gemini zamiast KeyBERT)
+    full_text_sample = " ".join(all_text_content)[:15000] # Próbka dla Gemini
+    semantic_keyphrases = extract_semantic_tags_gemini(full_text_sample)
 
     return jsonify({
         "main_keyword": main_keyword,
         "ngrams": results,
-        "entities": entities[:20],
-        "semantic_keyphrases": semantic_keyphrases,
+        "semantic_keyphrases": semantic_keyphrases, # Tu wchodzą wyniki z Gemini
         "summary": {
             "total_sources": len(sources),
-            "unique_ngrams": len(ngram_freqs),
-            "context_used": bool(serp_context),
-            "sentence_model": KEYBERT_MODEL_NAME,
-            "keybert_available": KEYBERT_AVAILABLE,
+            "engine": "v11-light-cloud"
         }
     })
 
 
 # ======================================================
-# 🧩 2️⃣ Endpoint: synteza tematów
+# 🧩 Pozostałe Endpointy (Proxy)
 # ======================================================
 @app.route("/api/synthesize_topics", methods=["POST"])
 def perform_synthesize_topics():
     data = request.get_json()
-    ngrams = data.get("ngrams", [])
-    headings = data.get("headings", [])
-    result = synthesize_topics(ngrams, headings)
-    return jsonify(result)
+    return jsonify(synthesize_topics(data.get("ngrams", []), data.get("headings", [])))
 
-
-# ======================================================
-# 🧩 3️⃣ Endpoint: raport licznika
-# ======================================================
 @app.route("/api/generate_compliance_report", methods=["POST"])
 def perform_generate_compliance_report():
     data = request.get_json()
-    text = data.get("text", "")
-    keyword_state_input = data.get("keyword_state") or data.get("keywords")
-    if not keyword_state_input:
-        return jsonify({"error": "Brak 'keyword_state' w payloadzie"}), 400
+    return jsonify(generate_compliance_report(data.get("text", ""), data.get("keyword_state", {})))
 
-    result = generate_compliance_report(text, keyword_state_input)
-    return jsonify(result)
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "mode": "lightweight-cloud-semantic"})
 
-
-# ======================================================
-# 🧩 Health
-# ======================================================
-@app.route("/", methods=["GET"])
-def root():
-    return jsonify({
-        "message": "GPT N-Gram & Entity API (v7.0 semantic) działa poprawnie.",
-    })
-
-
-@app.route("/api/health", methods=["GET"])
-def health_check():
-    return jsonify({
-        "status": "ok",
-        "version": "v7.0-semantic",
-        "sentence_model": KEYBERT_MODEL_NAME,
-        "keybert_available": KEYBERT_AVAILABLE,
-    })
-
-
+# Uruchomienie (dla lokalnych testów, Render używa Gunicorna)
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000)
