@@ -1,16 +1,17 @@
 Flask==3.0.3
 Flask-Cors==4.0.1
 requests==2.32.3
-python-dotenv==1.0.1
 gunicorn==21.2.0
 
-# --- NLP Lekkiej Wagi ---
+# --- Kluczowe dla działania ---
+rapidfuzz==3.9.7
 spacy==3.7.2
 https://github.com/explosion/spacy-models/releases/download/pl_core_news_sm-3.7.0/pl_core_news_sm-3.7.0.tar.gz#egg=pl_core_news_sm
 
-# --- Matematyka i ML (Lekkie) ---
-scikit-learn==1.3.2
-numpy==1.26.4
+# Jeśli używasz YAKE zamiast KeyBERT (dla oszczędności RAM):
+yake==0.4.8
 
-# --- Semantyka w Chmurze (Zamiast lokalnego KeyBERT) ---
-google-generativeai==0.5.2
+# Jeśli nadal używasz KeyBERT (uwaga na RAM!):
+# keybert==0.8.5
+# sentence-transformers==2.7.0
+# torch>=2.0.0
