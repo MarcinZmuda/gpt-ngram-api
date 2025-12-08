@@ -1,11 +1,14 @@
 services:
   - type: web
-    name: gpt-ngram-api
+    name: ngram-api
     env: python
-    region: frankfurt  # lub 'oregon' jeśli wolisz US
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn -w 1 -b 0.0.0.0:5000 api.index:app
+    buildCommand: pip install --no-cache-dir -r api/requirements.txt
+    startCommand: gunicorn -w 2 -b 0.0.0.0:$PORT api.index:app
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.3
+      - key: PORT
+        value: 10000
+      - key: DEBUG_MODE
+        value: false
+      - key: GEMINI_API_KEY
+        sync: false
