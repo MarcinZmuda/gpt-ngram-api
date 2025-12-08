@@ -13,8 +13,10 @@ from firebase_admin import firestore
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+else:
+    print("[S1] ⚠️ GEMINI_API_KEY not set — semantic extraction fallback active")
 
-# --- Importy lokalne (Poprawione z kropką dla struktury modułu) ---
+# --- Importy lokalne (dla trybu pakietowego i lokalnego) ---
 try:
     from .synthesize_topics import synthesize_topics
     from .generate_compliance_report import generate_compliance_report
@@ -24,13 +26,15 @@ except ImportError:
 
 app = Flask(__name__)
 
-# --- Ładowanie spaCy (Lekki model) ---
+# --- Ładowanie spaCy (lekki model do S1) ---
 try:
     nlp = spacy.load("pl_core_news_sm")
+    print("[S1] ✅ spaCy pl_core_news_sm loaded")
 except OSError:
     from spacy.cli import download
     download("pl_core_news_sm")
     nlp = spacy.load("pl_core_news_sm")
+    print("[S1] ✅ spaCy model downloaded and loaded")
 
 
 # ======================================================
@@ -53,7 +57,7 @@ def extract_semantic_tags_gemini(text, top_n=10):
         keywords = [k.strip() for k in response.text.split(",") if k.strip()]
         return [{"phrase": kw, "score": 0.95 - (i * 0.02)} for i, kw in enumerate(keywords[:top_n])]
     except Exception as e:
-        print(f"Gemini Semantic Error: {e}")
+        print(f"[S1] ❌ Gemini Semantic Error: {e}")
         return []
 
 
@@ -62,15 +66,16 @@ def extract_semantic_tags_gemini(text, top_n=10):
 # ======================================================
 @app.route("/api/ngram_entity_analysis", methods=["POST"])
 def perform_ngram_analysis():
-    data = request.get_json()
+    data = request.get_json(force=True)
     main_keyword = data.get("main_keyword", "")
-    serp_context = data.get("serp_context", {})
     sources = data.get("sources", [])
     top_n = int(data.get("top_n", 30))
-    project_id = data.get("project_id")  # 🔗 Optional Firestore integration
+    project_id = data.get("project_id")
 
     if not sources:
         return jsonify({"error": "Brak źródeł do analizy"}), 400
+
+    print(f"[S1] 🔍 Analiza n-gramów dla: {main_keyword}")
 
     # 1️⃣ NLP Statystyczne (N-gramy)
     ngram_presence = defaultdict(set)
@@ -79,8 +84,10 @@ def perform_ngram_analysis():
 
     for src in sources:
         content = src.get("content", "").lower()
-        all_text_content.append(src.get("content", ""))
+        if not content.strip():
+            continue
 
+        all_text_content.append(src.get("content", ""))
         doc = nlp(content[:100000])
         tokens = [t.text.lower() for t in doc if t.is_alpha]
 
@@ -120,7 +127,7 @@ def perform_ngram_analysis():
         "semantic_keyphrases": semantic_keyphrases,
         "summary": {
             "total_sources": len(sources),
-            "engine": "v18.0-semantic-cloud",
+            "engine": "v18.5-semantic-firestore",
             "lsi_candidates": len(semantic_keyphrases),
         }
     }
@@ -131,10 +138,14 @@ def perform_ngram_analysis():
             db = firestore.client()
             doc_ref = db.collection("seo_projects").document(project_id)
             if doc_ref.get().exists:
+                avg_len = (
+                    sum(len(t.split()) for t in all_text_content) // len(all_text_content)
+                    if all_text_content else 0
+                )
                 doc_ref.update({
                     "s1_data": response_payload,
                     "lsi_enrichment": {"enabled": True, "count": len(semantic_keyphrases)},
-                    "avg_competitor_length": sum(len(t.split()) for t in all_text_content) // len(all_text_content),
+                    "avg_competitor_length": avg_len,
                     "updated_at": firestore.SERVER_TIMESTAMP
                 })
                 response_payload["saved_to_firestore"] = True
@@ -154,19 +165,23 @@ def perform_ngram_analysis():
 # ======================================================
 @app.route("/api/synthesize_topics", methods=["POST"])
 def perform_synthesize_topics():
-    data = request.get_json()
+    data = request.get_json(force=True)
     return jsonify(synthesize_topics(data.get("ngrams", []), data.get("headings", [])))
 
 
 @app.route("/api/generate_compliance_report", methods=["POST"])
 def perform_generate_compliance_report():
-    data = request.get_json()
+    data = request.get_json(force=True)
     return jsonify(generate_compliance_report(data.get("text", ""), data.get("keyword_state", {})))
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "mode": "semantic-cloud-firestore"})
+    return jsonify({
+        "status": "ok",
+        "engine": "v18.5-semantic-firestore",
+        "gemini_enabled": bool(GEMINI_API_KEY)
+    })
 
 
 # ======================================================
