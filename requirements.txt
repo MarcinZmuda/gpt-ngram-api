@@ -1,21 +1,26 @@
 # ================================================================
-# 🇵🇱 NGRAM API v3.2 — Lightweight Semantic Engine (Render Ready)
+# 🇵🇱 NGRAM API v3.2 — Full Semantic Engine (Firestore + Gemini)
 # ================================================================
 
+# --- CORE ---
 Flask==3.0.3
 Flask-Cors==4.0.1
 requests==2.32.3
-python-dotenv==1.0.1
 gunicorn==21.2.0
+python-dotenv==1.0.1
+
+# --- DATABASE ---
+firebase-admin==6.5.0
 
 # --- NLP ---
 spacy==3.7.2
 pl-core-news-sm @ https://github.com/explosion/spacy-models/releases/download/pl_core_news_sm-3.7.0/pl_core_news_sm-3.7.0-py3-none-any.whl
-
-# --- Text Processing ---
-rapidfuzz==3.9.7
 numpy==1.26.4
 scikit-learn==1.3.2
+rapidfuzz==3.9.7
 
-# --- AI Semantics (Gemini) ---
+# --- AI (Gemini) ---
 google-generativeai==0.5.2
+
+# --- LOGGING ---
+rich==13.7.1
