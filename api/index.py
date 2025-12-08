@@ -5,18 +5,38 @@ from collections import Counter, defaultdict
 from flask import Flask, request, jsonify
 import spacy
 import google.generativeai as genai
+import firebase_admin
+from firebase_admin import credentials, firestore
 
-# --- Firestore Integration ---
-from firebase_admin import firestore
+# ======================================================
+# 🔥 Firebase Initialization (Safe for Render & Local)
+# ======================================================
+if not firebase_admin._apps:
+    cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    try:
+        if cred_path and os.path.exists(cred_path):
+            cred = credentials.Certificate(cred_path)
+            firebase_admin.initialize_app(cred)
+            print(f"[S1] ✅ Firebase initialized from credentials file: {cred_path}")
+        else:
+            firebase_admin.initialize_app()
+            print("[S1] ✅ Firebase initialized with default credentials")
+    except Exception as e:
+        print(f"[S1] ⚠️ Firebase init skipped: {e}")
 
-# --- Konfiguracja Gemini (Zastępstwo dla KeyBERT) ---
+# ======================================================
+# ⚙️ Gemini (Google Generative AI) Configuration
+# ======================================================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+    print("[S1] ✅ Gemini API configured")
 else:
     print("[S1] ⚠️ GEMINI_API_KEY not set — semantic extraction fallback active")
 
-# --- Importy lokalne (dla trybu pakietowego i lokalnego) ---
+# ======================================================
+# 🧠 Import local modules (compatible with both local and Render)
+# ======================================================
 try:
     from .synthesize_topics import synthesize_topics
     from .generate_compliance_report import generate_compliance_report
@@ -26,7 +46,9 @@ except ImportError:
 
 app = Flask(__name__)
 
-# --- Ładowanie spaCy (lekki model do S1) ---
+# ======================================================
+# 🧩 Load spaCy model (preinstalled lightweight version)
+# ======================================================
 try:
     nlp = spacy.load("pl_core_news_sm")
     print("[S1] ✅ spaCy pl_core_news_sm loaded")
@@ -36,9 +58,8 @@ except OSError:
     nlp = spacy.load("pl_core_news_sm")
     print("[S1] ✅ spaCy model downloaded and loaded")
 
-
 # ======================================================
-# 🧠 Helper: Semantyka przez Gemini (Cloud)
+# 🧠 Helper: Semantic extraction using Gemini Flash
 # ======================================================
 def extract_semantic_tags_gemini(text, top_n=10):
     """Używa Google Gemini Flash do wyciągnięcia fraz semantycznych."""
@@ -50,7 +71,7 @@ def extract_semantic_tags_gemini(text, top_n=10):
         prompt = f"""
         Jesteś ekspertem SEO. Przeanalizuj poniższy tekst i wypisz {top_n} najważniejszych fraz kluczowych (semantic keywords), które najlepiej oddają jego sens.
         Zwróć TYLKO listę po przecinku, bez numerowania.
-        
+
         TEKST: {text[:8000]}...
         """
         response = model.generate_content(prompt)
@@ -60,9 +81,8 @@ def extract_semantic_tags_gemini(text, top_n=10):
         print(f"[S1] ❌ Gemini Semantic Error: {e}")
         return []
 
-
 # ======================================================
-# 🧩 Endpoint: Analiza N-gramów + Semantyka Cloud + Firestore Save
+# 🔍 Endpoint: N-gram + Semantic + Firestore Save
 # ======================================================
 @app.route("/api/ngram_entity_analysis", methods=["POST"])
 def perform_ngram_analysis():
@@ -132,7 +152,7 @@ def perform_ngram_analysis():
         }
     }
 
-    # 3️⃣ Firestore Save (jeśli podano project_id)
+    # 3️⃣ Firestore Save (optional)
     if project_id:
         try:
             db = firestore.client()
@@ -159,7 +179,6 @@ def perform_ngram_analysis():
 
     return jsonify(response_payload)
 
-
 # ======================================================
 # 🧩 Pozostałe Endpointy (Proxy)
 # ======================================================
@@ -168,12 +187,10 @@ def perform_synthesize_topics():
     data = request.get_json(force=True)
     return jsonify(synthesize_topics(data.get("ngrams", []), data.get("headings", [])))
 
-
 @app.route("/api/generate_compliance_report", methods=["POST"])
 def perform_generate_compliance_report():
     data = request.get_json(force=True)
     return jsonify(generate_compliance_report(data.get("text", ""), data.get("keyword_state", {})))
-
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -182,7 +199,6 @@ def health():
         "engine": "v18.5-semantic-firestore",
         "gemini_enabled": bool(GEMINI_API_KEY)
     })
-
 
 # ======================================================
 # 🧩 Uruchomienie lokalne
