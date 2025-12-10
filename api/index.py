@@ -10,7 +10,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 # ======================================================
-# 🔑 SerpAPI Configuration
+# 🔑 SerpAPI Configuratio
 # ======================================================
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 if SERPAPI_KEY:
@@ -92,20 +92,123 @@ def extract_semantic_tags_gemini(text, top_n=10):
         return []
 
 # ======================================================
-# 🔍 Helper: Fetch sources from SerpAPI
+# 💡 Helper: Generate Content Hints (inspiracje dla GPT)
+# ======================================================
+def generate_content_hints(serp_analysis, main_keyword):
+    """
+    Przekształca surowe dane SERP w subtelne wskazówki dla GPT.
+    To są INSPIRACJE, nie twarde reguły - GPT ma je traktować jako tło.
+    
+    Returns:
+        dict: content_hints z delikatnymi podpowiedziami
+    """
+    hints = {}
+    
+    # 1️⃣ INTRO INSPIRATION - z Featured Snippet / AI Overview
+    featured = serp_analysis.get("featured_snippet")
+    if featured and featured.get("answer"):
+        hints["intro_inspiration"] = {
+            "google_promotes": featured.get("answer", "")[:500],
+            "source_type": featured.get("type", "unknown"),
+            "hint": "Google wyróżnia tę odpowiedź w wynikach. Rozważ napisanie lepszego/pełniejszego wstępu który naturalnie odpowiada na to samo pytanie. NIE kopiuj - napisz wartościowszą wersję."
+        }
+    
+    # 2️⃣ QUESTIONS USERS ASK - z PAA
+    paa = serp_analysis.get("paa_questions", [])
+    if paa:
+        questions = [q.get("question", "") for q in paa if q.get("question")][:6]
+        hints["questions_users_ask"] = {
+            "questions": questions,
+            "hint": "Użytkownicy często pytają o te rzeczy. Jeśli pasują do tematu, rozważ naturalne poruszenie w treści. Nie musisz odpowiadać na wszystkie - wybierz relevantne."
+        }
+        
+        # Bonus: krótkie odpowiedzi jako kontekst
+        qa_context = []
+        for q in paa[:3]:
+            if q.get("question") and q.get("answer"):
+                qa_context.append({
+                    "q": q.get("question"),
+                    "current_answer": q.get("answer", "")[:200]
+                })
+        if qa_context:
+            hints["questions_users_ask"]["current_answers_preview"] = qa_context
+    
+    # 3️⃣ RELATED TOPICS - z Related Searches
+    related = serp_analysis.get("related_searches", [])
+    if related:
+        hints["related_topics"] = {
+            "topics": related[:8],
+            "hint": "Powiązane frazy wyszukiwane przez użytkowników. Mogą naturalnie pojawić się w tekście jeśli są relevantne. Nie upychaj na siłę."
+        }
+    
+    # 4️⃣ COMPETITOR INSIGHTS - z tytułów i snippetów
+    titles = serp_analysis.get("competitor_titles", [])
+    snippets = serp_analysis.get("competitor_snippets", [])
+    if titles or snippets:
+        hints["competitor_insights"] = {
+            "hint": "Tak konkurencja prezentuje temat w SERP. Tylko dla orientacji - Twoje podejście może być inne i lepsze."
+        }
+        if titles:
+            hints["competitor_insights"]["title_patterns"] = titles[:5]
+        if snippets:
+            hints["competitor_insights"]["description_samples"] = snippets[:3]
+    
+    # 5️⃣ STRUCTURE INSPIRATION - z H2 konkurencji
+    h2_patterns = serp_analysis.get("competitor_h2_patterns", [])
+    if h2_patterns:
+        # Wybierz najbardziej unikalne/różnorodne H2
+        unique_h2 = list(dict.fromkeys(h2_patterns))[:10]
+        hints["structure_inspiration"] = {
+            "competitor_sections": unique_h2,
+            "hint": "Przykładowe sekcje używane przez konkurencję. Twoja struktura może być inna - to tylko kontekst co inni poruszają."
+        }
+    
+    # 6️⃣ META HINT - ogólna wskazówka
+    hints["_meta"] = {
+        "interpretation": "Te wskazówki to TŁO i INSPIRACJA, nie checklist. Artykuł ma być naturalny, wartościowy i unikalny. Używaj tych danych żeby lepiej zrozumieć intencję użytkownika, nie żeby mechanicznie odpowiadać na każdy punkt.",
+        "priority": "Jakość treści > dopasowanie do SERP"
+    }
+    
+    return hints
+
+# ======================================================
+# 🔍 Helper: Fetch sources from SerpAPI (FULL SERP DATA)
 # ======================================================
 def fetch_serp_sources(keyword, num_results=10):
     """
-    Pobiera top wyniki z Google przez SerpAPI i scrapuje ich treść.
-    Zwraca listę źródeł w formacie [{"url": "...", "content": "..."}]
+    Pobiera PEŁNE dane z Google przez SerpAPI:
+    - Organic results (top 10 stron) + scrapuje ich pełną treść
+    - PAA (People Also Ask)
+    - Featured Snippet
+    - Related Searches
+    - Tytuły i snippety z SERP
+    
+    Returns:
+        dict: {
+            "sources": [...],
+            "paa": [...],
+            "featured_snippet": {...},
+            "related_searches": [...],
+            "serp_titles": [...],
+            "serp_snippets": [...]
+        }
     """
+    empty_result = {
+        "sources": [],
+        "paa": [],
+        "featured_snippet": None,
+        "related_searches": [],
+        "serp_titles": [],
+        "serp_snippets": []
+    }
+    
     if not SERPAPI_KEY:
         print("[S1] ⚠️ SerpAPI key not configured - cannot fetch sources")
-        return []
+        return empty_result
     
     try:
         # 1. Pobierz wyniki z SerpAPI
-        print(f"[S1] 🔍 Fetching SERP results for: {keyword}")
+        print(f"[S1] 🔍 Fetching FULL SERP data for: {keyword}")
         serp_response = requests.get(
             "https://serpapi.com/search",
             params={
@@ -120,21 +223,76 @@ def fetch_serp_sources(keyword, num_results=10):
         
         if serp_response.status_code != 200:
             print(f"[S1] ❌ SerpAPI error: {serp_response.status_code}")
-            return []
+            return empty_result
         
         serp_data = serp_response.json()
+        
+        # ⭐ 2. Wyciągnij PAA (People Also Ask)
+        paa_questions = []
+        related_questions = serp_data.get("related_questions", [])
+        for q in related_questions:
+            paa_questions.append({
+                "question": q.get("question", ""),
+                "answer": q.get("snippet", ""),
+                "source": q.get("link", ""),
+                "title": q.get("title", "")
+            })
+        if paa_questions:
+            print(f"[S1] ✅ Found {len(paa_questions)} PAA questions")
+        
+        # ⭐ 3. Wyciągnij Featured Snippet (Answer Box)
+        featured_snippet = None
+        answer_box = serp_data.get("answer_box", {})
+        if answer_box:
+            featured_snippet = {
+                "type": answer_box.get("type", "unknown"),
+                "title": answer_box.get("title", ""),
+                "answer": answer_box.get("answer", "") or answer_box.get("snippet", ""),
+                "source": answer_box.get("link", ""),
+                "displayed_link": answer_box.get("displayed_link", "")
+            }
+            print(f"[S1] ✅ Found Featured Snippet: {featured_snippet.get('type')}")
+        
+        # ⭐ 4. Wyciągnij Related Searches
+        related_searches = []
+        for rs in serp_data.get("related_searches", []):
+            query = rs.get("query", "")
+            if query:
+                related_searches.append(query)
+        if related_searches:
+            print(f"[S1] ✅ Found {len(related_searches)} related searches")
+        
+        # ⭐ 5. Wyciągnij tytuły i snippety z organic results
         organic_results = serp_data.get("organic_results", [])
+        serp_titles = []
+        serp_snippets = []
+        
+        for result in organic_results:
+            title = result.get("title", "")
+            snippet = result.get("snippet", "")
+            if title:
+                serp_titles.append(title)
+            if snippet:
+                serp_snippets.append(snippet)
         
         if not organic_results:
             print("[S1] ⚠️ No organic results from SerpAPI")
-            return []
+            return {
+                "sources": [],
+                "paa": paa_questions,
+                "featured_snippet": featured_snippet,
+                "related_searches": related_searches,
+                "serp_titles": serp_titles,
+                "serp_snippets": serp_snippets
+            }
         
         print(f"[S1] ✅ Found {len(organic_results)} SERP results")
         
-        # 2. Scrapuj treść każdej strony
+        # ⭐ 6. Scrapuj PEŁNĄ treść każdej strony + strukturę H2
         sources = []
         for result in organic_results[:num_results]:
             url = result.get("link", "")
+            title = result.get("title", "")
             if not url:
                 continue
             
@@ -143,15 +301,23 @@ def fetch_serp_sources(keyword, num_results=10):
                 page_response = requests.get(
                     url,
                     timeout=10,
-                    headers={"User-Agent": "Mozilla/5.0 (compatible; SEOBot/1.0)"}
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
                 )
                 
                 if page_response.status_code == 200:
-                    # Prosty scraping - usuń HTML tagi
                     content = page_response.text
-                    # Usuń script i style
+                    
+                    # ⭐ Wyciągnij H2 przed usunięciem tagów
+                    h2_tags = re.findall(r'<h2[^>]*>(.*?)</h2>', content, re.IGNORECASE | re.DOTALL)
+                    h2_clean = [re.sub(r'<[^>]+>', '', h).strip() for h in h2_tags]
+                    h2_clean = [h for h in h2_clean if h]  # Usuń puste
+                    
+                    # Usuń script, style, nav, footer, header
                     content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL | re.IGNORECASE)
                     content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                    content = re.sub(r'<nav[^>]*>.*?</nav>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                    content = re.sub(r'<footer[^>]*>.*?</footer>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                    content = re.sub(r'<header[^>]*>.*?</header>', '', content, flags=re.DOTALL | re.IGNORECASE)
                     # Usuń wszystkie tagi HTML
                     content = re.sub(r'<[^>]+>', ' ', content)
                     # Usuń wielokrotne spacje
@@ -160,9 +326,11 @@ def fetch_serp_sources(keyword, num_results=10):
                     if len(content) > 500:  # Minimum 500 znaków
                         sources.append({
                             "url": url,
-                            "content": content[:50000]  # Max 50k znaków per source
+                            "title": title,
+                            "content": content[:50000],  # Max 50k znaków per source
+                            "h2_structure": h2_clean[:15]  # Max 15 H2
                         })
-                        print(f"[S1] ✅ Scraped {len(content)} chars from {url[:40]}")
+                        print(f"[S1] ✅ Scraped {len(content)} chars, {len(h2_clean)} H2 from {url[:40]}")
                     else:
                         print(f"[S1] ⚠️ Too short content from {url[:40]}")
                         
@@ -170,15 +338,23 @@ def fetch_serp_sources(keyword, num_results=10):
                 print(f"[S1] ⚠️ Scrape error for {url[:40]}: {e}")
                 continue
         
-        print(f"[S1] ✅ Successfully scraped {len(sources)} sources")
-        return sources
+        print(f"[S1] ✅ Successfully scraped {len(sources)} sources with full content")
+        
+        return {
+            "sources": sources,
+            "paa": paa_questions,
+            "featured_snippet": featured_snippet,
+            "related_searches": related_searches,
+            "serp_titles": serp_titles,
+            "serp_snippets": serp_snippets
+        }
         
     except Exception as e:
         print(f"[S1] ❌ SerpAPI fetch error: {e}")
-        return []
+        return empty_result
 
 # ======================================================
-# 🔍 Endpoint: N-gram + Semantic + Firestore Save
+# 🔍 Endpoint: N-gram + Semantic + SERP Analysis + Firestore Save
 # ======================================================
 @app.route("/api/ngram_entity_analysis", methods=["POST"])
 def perform_ngram_analysis():
@@ -187,20 +363,39 @@ def perform_ngram_analysis():
     sources = data.get("sources", [])
     top_n = int(data.get("top_n", 30))
     project_id = data.get("project_id")
+    
+    # ⭐ Zmienne na dodatkowe dane SERP
+    paa_questions = []
+    featured_snippet = None
+    related_searches = []
+    serp_titles = []
+    serp_snippets = []
+    h2_patterns = []
 
-    # ⭐ AUTO-FETCH: Jeśli brak sources, pobierz z SerpAPI
+    # ⭐ AUTO-FETCH: Jeśli brak sources, pobierz PEŁNE dane z SerpAPI
     if not sources:
         if not main_keyword:
             return jsonify({"error": "Brak main_keyword do analizy"}), 400
         
-        print(f"[S1] 🔄 No sources provided - auto-fetching from SerpAPI...")
-        sources = fetch_serp_sources(main_keyword, num_results=10)
+        print(f"[S1] 🔄 No sources provided - auto-fetching FULL SERP data...")
+        serp_result = fetch_serp_sources(main_keyword, num_results=10)
+        
+        # Wyciągnij wszystkie dane z rezultatu
+        sources = serp_result.get("sources", [])
+        paa_questions = serp_result.get("paa", [])
+        featured_snippet = serp_result.get("featured_snippet")
+        related_searches = serp_result.get("related_searches", [])
+        serp_titles = serp_result.get("serp_titles", [])
+        serp_snippets = serp_result.get("serp_snippets", [])
         
         if not sources:
             return jsonify({
                 "error": "Nie udało się pobrać źródeł z SerpAPI",
                 "hint": "Sprawdź czy SERPAPI_KEY jest ustawiony i ważny",
-                "main_keyword": main_keyword
+                "main_keyword": main_keyword,
+                # ⭐ Zwróć PAA i related searches nawet bez sources
+                "paa": paa_questions,
+                "related_searches": related_searches
             }), 400
 
     print(f"[S1] 🔍 Analiza n-gramów dla: {main_keyword}")
@@ -216,6 +411,12 @@ def perform_ngram_analysis():
             continue
 
         all_text_content.append(src.get("content", ""))
+        
+        # ⭐ Zbierz struktury H2 z konkurencji
+        src_h2 = src.get("h2_structure", [])
+        if src_h2:
+            h2_patterns.extend(src_h2)
+        
         doc = nlp(content[:100000])
         tokens = [t.text.lower() for t in doc if t.is_alpha]
 
@@ -232,7 +433,7 @@ def perform_ngram_analysis():
         if freq < 2:
             continue
         freq_norm = freq / max_freq
-        site_score = len(ngram_presence[ngram]) / len(sources)
+        site_score = len(ngram_presence[ngram]) / len(sources) if sources else 0
         weight = round(freq_norm * 0.5 + site_score * 0.5, 4)
         if main_keyword.lower() in ngram:
             weight += 0.1
@@ -248,15 +449,44 @@ def perform_ngram_analysis():
     # 2️⃣ Semantyka (Gemini Flash)
     full_text_sample = " ".join(all_text_content)[:15000]
     semantic_keyphrases = extract_semantic_tags_gemini(full_text_sample)
+    
+    # ⭐ Unikalne H2 z konkurencji (bez duplikatów)
+    unique_h2_patterns = list(dict.fromkeys(h2_patterns))[:30]
+    
+    # ⭐ Przygotuj serp_analysis
+    serp_analysis_data = {
+        "paa_questions": paa_questions,
+        "featured_snippet": featured_snippet,
+        "related_searches": related_searches,
+        "competitor_titles": serp_titles[:10],
+        "competitor_snippets": serp_snippets[:10],
+        "competitor_h2_patterns": unique_h2_patterns,
+    }
+    
+    # 3️⃣ Content Hints - subtelne wskazówki dla GPT (NOWE!)
+    content_hints = generate_content_hints(serp_analysis_data, main_keyword)
 
+    # ⭐ PEŁNA ODPOWIEDŹ z wszystkimi danymi SERP
     response_payload = {
         "main_keyword": main_keyword,
         "ngrams": results,
         "semantic_keyphrases": semantic_keyphrases,
+        
+        # ⭐ Pełna analiza SERP (surowe dane)
+        "serp_analysis": serp_analysis_data,
+        
+        # ⭐ NOWE: Content Hints - inspiracje dla GPT
+        "content_hints": content_hints,
+        
         "summary": {
             "total_sources": len(sources),
-            "sources_auto_fetched": not bool(data.get("sources", [])),  # ⭐ Info czy auto-fetch
-            "engine": "v18.6-serpapi-autofetch",
+            "sources_auto_fetched": not bool(data.get("sources", [])),
+            "paa_count": len(paa_questions),
+            "has_featured_snippet": featured_snippet is not None,
+            "related_searches_count": len(related_searches),
+            "h2_patterns_found": len(unique_h2_patterns),
+            "content_hints_generated": bool(content_hints),
+            "engine": "v19.1-content-hints",
             "lsi_candidates": len(semantic_keyphrases),
         }
     }
@@ -305,9 +535,17 @@ def perform_generate_compliance_report():
 def health():
     return jsonify({
         "status": "ok",
-        "engine": "v18.6-serpapi-autofetch",
-        "gemini_enabled": bool(GEMINI_API_KEY),
-        "serpapi_enabled": bool(SERPAPI_KEY)
+        "engine": "v19.1-content-hints",
+        "features": {
+            "gemini_enabled": bool(GEMINI_API_KEY),
+            "serpapi_enabled": bool(SERPAPI_KEY),
+            "paa_extraction": True,
+            "featured_snippet_extraction": True,
+            "related_searches_extraction": True,
+            "competitor_h2_analysis": True,
+            "full_content_scraping": True,
+            "content_hints_generation": True  # NOWE!
+        }
     })
 
 # ======================================================
