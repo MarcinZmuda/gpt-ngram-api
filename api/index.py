@@ -1,12 +1,22 @@
 import os
 import json
 import re
+import requests
 from collections import Counter, defaultdict
 from flask import Flask, request, jsonify
 import spacy
 import google.generativeai as genai
 import firebase_admin
 from firebase_admin import credentials, firestore
+
+# ======================================================
+# 🔑 SerpAPI Configuration
+# ======================================================
+SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+if SERPAPI_KEY:
+    print("[S1] ✅ SerpAPI key configured")
+else:
+    print("[S1] ⚠️ SERPAPI_KEY not set — auto-fetch disabled")
 
 # ======================================================
 # 🔥 Firebase Initialization (Safe for Render & Local)
@@ -82,6 +92,92 @@ def extract_semantic_tags_gemini(text, top_n=10):
         return []
 
 # ======================================================
+# 🔍 Helper: Fetch sources from SerpAPI
+# ======================================================
+def fetch_serp_sources(keyword, num_results=10):
+    """
+    Pobiera top wyniki z Google przez SerpAPI i scrapuje ich treść.
+    Zwraca listę źródeł w formacie [{"url": "...", "content": "..."}]
+    """
+    if not SERPAPI_KEY:
+        print("[S1] ⚠️ SerpAPI key not configured - cannot fetch sources")
+        return []
+    
+    try:
+        # 1. Pobierz wyniki z SerpAPI
+        print(f"[S1] 🔍 Fetching SERP results for: {keyword}")
+        serp_response = requests.get(
+            "https://serpapi.com/search",
+            params={
+                "q": keyword,
+                "api_key": SERPAPI_KEY,
+                "num": num_results,
+                "hl": "pl",
+                "gl": "pl"
+            },
+            timeout=30
+        )
+        
+        if serp_response.status_code != 200:
+            print(f"[S1] ❌ SerpAPI error: {serp_response.status_code}")
+            return []
+        
+        serp_data = serp_response.json()
+        organic_results = serp_data.get("organic_results", [])
+        
+        if not organic_results:
+            print("[S1] ⚠️ No organic results from SerpAPI")
+            return []
+        
+        print(f"[S1] ✅ Found {len(organic_results)} SERP results")
+        
+        # 2. Scrapuj treść każdej strony
+        sources = []
+        for result in organic_results[:num_results]:
+            url = result.get("link", "")
+            if not url:
+                continue
+            
+            try:
+                print(f"[S1] 📄 Scraping: {url[:60]}...")
+                page_response = requests.get(
+                    url,
+                    timeout=10,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; SEOBot/1.0)"}
+                )
+                
+                if page_response.status_code == 200:
+                    # Prosty scraping - usuń HTML tagi
+                    content = page_response.text
+                    # Usuń script i style
+                    content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                    content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                    # Usuń wszystkie tagi HTML
+                    content = re.sub(r'<[^>]+>', ' ', content)
+                    # Usuń wielokrotne spacje
+                    content = re.sub(r'\s+', ' ', content).strip()
+                    
+                    if len(content) > 500:  # Minimum 500 znaków
+                        sources.append({
+                            "url": url,
+                            "content": content[:50000]  # Max 50k znaków per source
+                        })
+                        print(f"[S1] ✅ Scraped {len(content)} chars from {url[:40]}")
+                    else:
+                        print(f"[S1] ⚠️ Too short content from {url[:40]}")
+                        
+            except Exception as e:
+                print(f"[S1] ⚠️ Scrape error for {url[:40]}: {e}")
+                continue
+        
+        print(f"[S1] ✅ Successfully scraped {len(sources)} sources")
+        return sources
+        
+    except Exception as e:
+        print(f"[S1] ❌ SerpAPI fetch error: {e}")
+        return []
+
+# ======================================================
 # 🔍 Endpoint: N-gram + Semantic + Firestore Save
 # ======================================================
 @app.route("/api/ngram_entity_analysis", methods=["POST"])
@@ -92,8 +188,20 @@ def perform_ngram_analysis():
     top_n = int(data.get("top_n", 30))
     project_id = data.get("project_id")
 
+    # ⭐ AUTO-FETCH: Jeśli brak sources, pobierz z SerpAPI
     if not sources:
-        return jsonify({"error": "Brak źródeł do analizy"}), 400
+        if not main_keyword:
+            return jsonify({"error": "Brak main_keyword do analizy"}), 400
+        
+        print(f"[S1] 🔄 No sources provided - auto-fetching from SerpAPI...")
+        sources = fetch_serp_sources(main_keyword, num_results=10)
+        
+        if not sources:
+            return jsonify({
+                "error": "Nie udało się pobrać źródeł z SerpAPI",
+                "hint": "Sprawdź czy SERPAPI_KEY jest ustawiony i ważny",
+                "main_keyword": main_keyword
+            }), 400
 
     print(f"[S1] 🔍 Analiza n-gramów dla: {main_keyword}")
 
@@ -147,7 +255,8 @@ def perform_ngram_analysis():
         "semantic_keyphrases": semantic_keyphrases,
         "summary": {
             "total_sources": len(sources),
-            "engine": "v18.5-semantic-firestore",
+            "sources_auto_fetched": not bool(data.get("sources", [])),  # ⭐ Info czy auto-fetch
+            "engine": "v18.6-serpapi-autofetch",
             "lsi_candidates": len(semantic_keyphrases),
         }
     }
@@ -196,8 +305,9 @@ def perform_generate_compliance_report():
 def health():
     return jsonify({
         "status": "ok",
-        "engine": "v18.5-semantic-firestore",
-        "gemini_enabled": bool(GEMINI_API_KEY)
+        "engine": "v18.6-serpapi-autofetch",
+        "gemini_enabled": bool(GEMINI_API_KEY),
+        "serpapi_enabled": bool(SERPAPI_KEY)
     })
 
 # ======================================================
