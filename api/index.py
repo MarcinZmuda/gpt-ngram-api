@@ -77,7 +77,7 @@ def extract_semantic_tags_gemini(text, top_n=10):
         return []
 
     try:
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        model = genai.GenerativeModel("gemini-2.5-flash")
         prompt = f"""
         Jesteś ekspertem SEO. Przeanalizuj poniższy tekst i wypisz {top_n} najważniejszych fraz kluczowych (semantic keywords), które najlepiej oddają jego sens.
         Zwróć TYLKO listę po przecinku, bez numerowania.
