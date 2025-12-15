@@ -77,7 +77,7 @@ def extract_semantic_tags_gemini(text, top_n=10):
         return []
 
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.0-flash-exp")
         prompt = f"""
         Jesteś ekspertem SEO. Przeanalizuj poniższy tekst i wypisz {top_n} najważniejszych fraz kluczowych (semantic keywords), które najlepiej oddają jego sens.
         Zwróć TYLKO listę po przecinku, bez numerowania.
@@ -476,7 +476,7 @@ def perform_ngram_analysis():
             "related_searches_count": len(related_searches),
             "h2_patterns_found": len(unique_h2_patterns),
             "content_hints_generated": bool(content_hints),
-            "engine": "v19.1-content-hints",
+            "engine": "v22.0-gemini-fixed",
             "lsi_candidates": len(semantic_keyphrases),
         }
     }
@@ -531,7 +531,7 @@ def perform_generate_compliance_report():
 def health():
     return jsonify({
         "status": "ok",
-        "engine": "v19.1-content-hints",
+        "engine": "v22.0-gemini-fixed",
         "features": {
             "gemini_enabled": bool(GEMINI_API_KEY),
             "serpapi_enabled": bool(SERPAPI_KEY),
