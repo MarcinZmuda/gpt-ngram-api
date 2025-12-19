@@ -10,6 +10,14 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 # ======================================================
+# ⭐ v22.3 LIMITS - zapobieganie OOM
+# ======================================================
+MAX_CONTENT_SIZE = 30000      # Max 30KB per page (było unlimited → 175KB crash)
+MAX_TOTAL_CONTENT = 200000    # Max 200KB total content
+SCRAPE_TIMEOUT = 8            # 8 sekund timeout per page (było 10)
+SKIP_DOMAINS = ['bip.', '.pdf', 'gov.pl/dana/', '/uploads/files/']  # Skip duże dokumenty
+
+# ======================================================
 # 🔑 SerpAPI Configuration
 # ======================================================
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
@@ -67,6 +75,20 @@ except OSError:
     download("pl_core_news_sm")
     nlp = spacy.load("pl_core_news_sm")
     print("[S1] ✅ spaCy model downloaded and loaded")
+
+# ======================================================
+# ⭐ v22.3 Helper: Check if URL should be skipped
+# ======================================================
+def should_skip_url(url):
+    """Sprawdza czy URL powinien być pominięty (duże dokumenty, PDF, BIP)."""
+    url_lower = url.lower()
+    for skip_pattern in SKIP_DOMAINS:
+        if skip_pattern in url_lower:
+            return True
+    # Skip jeśli URL kończy się na rozszerzenie pliku
+    if any(url_lower.endswith(ext) for ext in ['.pdf', '.doc', '.docx', '.xls', '.xlsx']):
+        return True
+    return False
 
 # ======================================================
 # 🧠 Helper: Semantic extraction using Gemini Flash
@@ -178,6 +200,8 @@ def fetch_serp_sources(keyword, num_results=10):
     - Featured Snippet
     - Related Searches
     - Tytuły i snippety z SERP
+    
+    ⭐ v22.3: Dodano limity rozmiaru i skip dla dużych dokumentów
     """
     empty_result = {
         "sources": [],
@@ -275,27 +299,44 @@ def fetch_serp_sources(keyword, num_results=10):
 
         # ⭐ 6. Scrapuj PEŁNĄ treść każdej strony + strukturę H2
         sources = []
+        total_content_size = 0  # ⭐ v22.3: Track total size
+        
         for result in organic_results[:num_results]:
             url = result.get("link", "")
             title = result.get("title", "")
             if not url:
                 continue
+            
+            # ⭐ v22.3: Skip duże dokumenty (BIP, PDF, etc.)
+            if should_skip_url(url):
+                print(f"[S1] ⏭️ Skipping large doc pattern: {url[:50]}...")
+                continue
+            
+            # ⭐ v22.3: Stop jeśli przekroczono total limit
+            if total_content_size >= MAX_TOTAL_CONTENT:
+                print(f"[S1] ⚠️ Total content limit reached ({MAX_TOTAL_CONTENT} chars), stopping scrape")
+                break
 
             try:
                 print(f"[S1] 📄 Scraping: {url[:60]}...")
                 page_response = requests.get(
                     url,
-                    timeout=10,
+                    timeout=SCRAPE_TIMEOUT,  # ⭐ v22.3: Reduced timeout
                     headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
                 )
 
                 if page_response.status_code == 200:
                     content = page_response.text
+                    
+                    # ⭐ v22.3: Limit content size PRZED przetwarzaniem
+                    if len(content) > MAX_CONTENT_SIZE * 2:  # Raw HTML jest ~2x większy
+                        print(f"[S1] ⚠️ Content too large ({len(content)} chars), truncating: {url[:40]}")
+                        content = content[:MAX_CONTENT_SIZE * 2]
 
                     # ⭐ Wyciągnij H2 przed usunięciem tagów
                     h2_tags = re.findall(r'<h2[^>]*>(.*?)</h2>', content, re.IGNORECASE | re.DOTALL)
                     h2_clean = [re.sub(r'<[^>]+>', '', h).strip() for h in h2_tags]
-                    h2_clean = [h for h in h2_clean if h]
+                    h2_clean = [h for h in h2_clean if h and len(h) < 200]  # ⭐ v22.3: Skip too long H2
 
                     # Usuń script, style, nav, footer, header
                     content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL | re.IGNORECASE)
@@ -307,23 +348,30 @@ def fetch_serp_sources(keyword, num_results=10):
                     content = re.sub(r'<[^>]+>', ' ', content)
                     # Usuń wielokrotne spacje
                     content = re.sub(r'\s+', ' ', content).strip()
+                    
+                    # ⭐ v22.3: Final content limit
+                    content = content[:MAX_CONTENT_SIZE]
 
                     if len(content) > 500:
                         sources.append({
                             "url": url,
                             "title": title,
-                            "content": content[:50000],
+                            "content": content,
                             "h2_structure": h2_clean[:15]
                         })
+                        total_content_size += len(content)  # ⭐ v22.3: Track size
                         print(f"[S1] ✅ Scraped {len(content)} chars, {len(h2_clean)} H2 from {url[:40]}")
                     else:
                         print(f"[S1] ⚠️ Too short content from {url[:40]}")
 
+            except requests.exceptions.Timeout:
+                print(f"[S1] ⏱️ Timeout for {url[:40]} (>{SCRAPE_TIMEOUT}s)")
+                continue
             except Exception as e:
                 print(f"[S1] ⚠️ Scrape error for {url[:40]}: {e}")
                 continue
 
-        print(f"[S1] ✅ Successfully scraped {len(sources)} sources with full content")
+        print(f"[S1] ✅ Successfully scraped {len(sources)} sources ({total_content_size} total chars)")
 
         return {
             "sources": sources,
@@ -363,7 +411,7 @@ def perform_ngram_analysis():
             return jsonify({"error": "Brak main_keyword do analizy"}), 400
 
         print(f"[S1] 🔄 No sources provided - auto-fetching FULL SERP data...")
-        serp_result = fetch_serp_sources(main_keyword, num_results=10)
+        serp_result = fetch_serp_sources(main_keyword, num_results=8)  # ⭐ v22.3: Reduced from 10 to 8
 
         # Wyciągnij wszystkie dane z rezultatu
         sources = serp_result.get("sources", [])
@@ -401,7 +449,8 @@ def perform_ngram_analysis():
         if src_h2:
             h2_patterns.extend(src_h2)
 
-        doc = nlp(content[:100000])
+        # ⭐ v22.3: Limit content for NLP processing
+        doc = nlp(content[:50000])  # Reduced from 100000
         tokens = [t.text.lower() for t in doc if t.is_alpha]
 
         for n in range(2, 5):
@@ -476,7 +525,7 @@ def perform_ngram_analysis():
             "related_searches_count": len(related_searches),
             "h2_patterns_found": len(unique_h2_patterns),
             "content_hints_generated": bool(content_hints),
-            "engine": "v22.0-gemini-fixed",
+            "engine": "v22.3-oom-fix",  # ⭐ v22.3
             "lsi_candidates": len(semantic_keyphrases),
         }
     }
@@ -531,7 +580,13 @@ def perform_generate_compliance_report():
 def health():
     return jsonify({
         "status": "ok",
-        "engine": "v22.0-gemini-fixed",
+        "engine": "v22.3-oom-fix",  # ⭐ v22.3
+        "limits": {
+            "max_content_per_page": MAX_CONTENT_SIZE,
+            "max_total_content": MAX_TOTAL_CONTENT,
+            "scrape_timeout": SCRAPE_TIMEOUT,
+            "skip_domains": SKIP_DOMAINS
+        },
         "features": {
             "gemini_enabled": bool(GEMINI_API_KEY),
             "serpapi_enabled": bool(SERPAPI_KEY),
@@ -540,7 +595,8 @@ def health():
             "related_searches_extraction": True,
             "competitor_h2_analysis": True,
             "full_content_scraping": True,
-            "content_hints_generation": True
+            "content_hints_generation": True,
+            "oom_protection": True  # ⭐ v22.3
         }
     })
 
