@@ -353,14 +353,18 @@ def fetch_serp_sources(keyword, num_results=10):
                     content = content[:MAX_CONTENT_SIZE]
 
                     if len(content) > 500:
+                        # v27.0: Dodaj word_count dla recommended_length
+                        word_count = len(content.split())
+                        
                         sources.append({
                             "url": url,
                             "title": title,
                             "content": content,
-                            "h2_structure": h2_clean[:15]
+                            "h2_structure": h2_clean[:15],
+                            "word_count": word_count  # v27.0: dla recommended_length
                         })
                         total_content_size += len(content)  # ⭐ v22.3: Track size
-                        print(f"[S1] ✅ Scraped {len(content)} chars, {len(h2_clean)} H2 from {url[:40]}")
+                        print(f"[S1] ✅ Scraped {len(content)} chars ({word_count} words), {len(h2_clean)} H2 from {url[:40]}")
                     else:
                         print(f"[S1] ⚠️ Too short content from {url[:40]}")
 
@@ -392,7 +396,10 @@ def fetch_serp_sources(keyword, num_results=10):
 @app.route("/api/ngram_entity_analysis", methods=["POST"])
 def perform_ngram_analysis():
     data = request.get_json(force=True)
-    main_keyword = data.get("main_keyword", "")
+    
+    # v27.0: Akceptuj zarówno "keyword" jak i "main_keyword"
+    main_keyword = data.get("main_keyword") or data.get("keyword", "")
+    
     sources = data.get("sources", [])
     top_n = int(data.get("top_n", 30))
     project_id = data.get("project_id")
@@ -494,6 +501,16 @@ def perform_ngram_analysis():
         "competitor_titles": serp_titles[:10],
         "competitor_snippets": serp_snippets[:10],
         "competitor_h2_patterns": unique_h2_patterns,
+        # v27.0: Dodaj competitors z word_count dla recommended_length
+        "competitors": [
+            {
+                "url": src.get("url", ""),
+                "title": src.get("title", ""),
+                "word_count": src.get("word_count", 0),
+                "h2_count": len(src.get("h2_structure", []))
+            }
+            for src in sources
+        ]
     }
 
     # 3️⃣ Content Hints - subtelne wskazówki dla GPT
@@ -525,7 +542,7 @@ def perform_ngram_analysis():
             "related_searches_count": len(related_searches),
             "h2_patterns_found": len(unique_h2_patterns),
             "content_hints_generated": bool(content_hints),
-            "engine": "v22.3-oom-fix",  # ⭐ v22.3
+            "engine": "v27.0",
             "lsi_candidates": len(semantic_keyphrases),
         }
     }
@@ -580,7 +597,7 @@ def perform_generate_compliance_report():
 def health():
     return jsonify({
         "status": "ok",
-        "engine": "v22.3-oom-fix",  # ⭐ v22.3
+        "engine": "v27.0",
         "limits": {
             "max_content_per_page": MAX_CONTENT_SIZE,
             "max_total_content": MAX_TOTAL_CONTENT,
@@ -594,9 +611,11 @@ def health():
             "featured_snippet_extraction": True,
             "related_searches_extraction": True,
             "competitor_h2_analysis": True,
+            "competitor_word_count": True,  # v27.0
             "full_content_scraping": True,
             "content_hints_generation": True,
-            "oom_protection": True  # ⭐ v22.3
+            "oom_protection": True,
+            "keyword_alias_support": True  # v27.0: accepts both keyword and main_keyword
         }
     })
 
