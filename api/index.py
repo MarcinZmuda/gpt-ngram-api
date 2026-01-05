@@ -207,6 +207,7 @@ def fetch_serp_sources(keyword, num_results=10):
         "sources": [],
         "paa": [],
         "featured_snippet": None,
+        "ai_overview": None,  # v27.0
         "related_searches": [],
         "serp_titles": [],
         "serp_snippets": []
@@ -235,6 +236,24 @@ def fetch_serp_sources(keyword, num_results=10):
             return empty_result
 
         serp_data = serp_response.json()
+
+        # ⭐ v27.0: Wyciągnij AI Overview (Google SGE)
+        ai_overview = None
+        ai_overview_data = serp_data.get("ai_overview", {})
+        if ai_overview_data:
+            ai_overview = {
+                "text": ai_overview_data.get("text", "") or ai_overview_data.get("snippet", ""),
+                "sources": [
+                    {
+                        "title": src.get("title", ""),
+                        "link": src.get("link", ""),
+                        "snippet": src.get("snippet", "")
+                    }
+                    for src in ai_overview_data.get("sources", [])[:5]
+                ],
+                "text_blocks": ai_overview_data.get("text_blocks", [])
+            }
+            print(f"[S1] ✅ Found AI Overview ({len(ai_overview.get('text', ''))} chars)")
 
         # ⭐ 2. Wyciągnij PAA (People Also Ask)
         paa_questions = []
@@ -290,6 +309,7 @@ def fetch_serp_sources(keyword, num_results=10):
                 "sources": [],
                 "paa": paa_questions,
                 "featured_snippet": featured_snippet,
+                "ai_overview": ai_overview,  # v27.0
                 "related_searches": related_searches,
                 "serp_titles": serp_titles,
                 "serp_snippets": serp_snippets
@@ -381,6 +401,7 @@ def fetch_serp_sources(keyword, num_results=10):
             "sources": sources,
             "paa": paa_questions,
             "featured_snippet": featured_snippet,
+            "ai_overview": ai_overview,  # v27.0
             "related_searches": related_searches,
             "serp_titles": serp_titles,
             "serp_snippets": serp_snippets
@@ -407,6 +428,7 @@ def perform_ngram_analysis():
     # ⭐ Zmienne na dodatkowe dane SERP
     paa_questions = []
     featured_snippet = None
+    ai_overview = None  # v27.0: Google SGE
     related_searches = []
     serp_titles = []
     serp_snippets = []
@@ -424,6 +446,7 @@ def perform_ngram_analysis():
         sources = serp_result.get("sources", [])
         paa_questions = serp_result.get("paa", [])
         featured_snippet = serp_result.get("featured_snippet")
+        ai_overview = serp_result.get("ai_overview")  # v27.0
         related_searches = serp_result.get("related_searches", [])
         serp_titles = serp_result.get("serp_titles", [])
         serp_snippets = serp_result.get("serp_snippets", [])
@@ -497,6 +520,7 @@ def perform_ngram_analysis():
     serp_analysis_data = {
         "paa_questions": paa_questions,
         "featured_snippet": featured_snippet,
+        "ai_overview": ai_overview,  # v27.0: Google SGE
         "related_searches": related_searches,
         "competitor_titles": serp_titles[:10],
         "competitor_snippets": serp_snippets[:10],
@@ -539,6 +563,7 @@ def perform_ngram_analysis():
             "sources_auto_fetched": not bool(data.get("sources", [])),
             "paa_count": len(paa_questions),
             "has_featured_snippet": featured_snippet is not None,
+            "has_ai_overview": ai_overview is not None,  # v27.0
             "related_searches_count": len(related_searches),
             "h2_patterns_found": len(unique_h2_patterns),
             "content_hints_generated": bool(content_hints),
@@ -609,6 +634,7 @@ def health():
             "serpapi_enabled": bool(SERPAPI_KEY),
             "paa_extraction": True,
             "featured_snippet_extraction": True,
+            "ai_overview_extraction": True,  # v27.0: Google SGE
             "related_searches_extraction": True,
             "competitor_h2_analysis": True,
             "competitor_word_count": True,  # v27.0
