@@ -543,8 +543,8 @@ def perform_ngram_analysis():
         ]
     }
 
-    # 3️⃣ Content Hints - subtelne wskazówki dla GPT
-    content_hints = generate_content_hints(serp_analysis_data, main_keyword)
+    # 3️⃣ Content Hints - WYŁĄCZONE v28.0 (duplikuje dane z serp_analysis)
+    # content_hints = generate_content_hints(serp_analysis_data, main_keyword)
 
     # 4️⃣ 🆕 Entity SEO Analysis (v28.0)
     entity_seo_data = None
@@ -577,8 +577,8 @@ def perform_ngram_analysis():
         # ⭐ Pełna analiza SERP (surowe dane)
         "serp_analysis": serp_analysis_data,
 
-        # ⭐ Content Hints - inspiracje dla GPT
-        "content_hints": content_hints,
+        # ⭐ Content Hints - WYŁĄCZONE v28.0 (BRAJEN używa serp_analysis bezpośrednio)
+        # "content_hints": content_hints,
 
         # 🆕 Entity SEO (v28.0)
         "entity_seo": entity_seo_data,
@@ -588,13 +588,12 @@ def perform_ngram_analysis():
             "sources_auto_fetched": not bool(data.get("sources", [])),
             "paa_count": len(paa_questions),
             "has_featured_snippet": featured_snippet is not None,
-            "has_ai_overview": ai_overview is not None,  # v27.0
+            "has_ai_overview": ai_overview is not None,
             "related_searches_count": len(related_searches),
             "h2_patterns_found": len(unique_h2_patterns),
-            "content_hints_generated": bool(content_hints),
-            "entity_seo_enabled": ENTITY_SEO_ENABLED,  # 🆕 v28.0
+            "entity_seo_enabled": ENTITY_SEO_ENABLED,
             "entities_found": entity_seo_data.get("entity_seo_summary", {}).get("total_entities", 0) if entity_seo_data else 0,
-            "engine": "v28.0",  # Updated version
+            "engine": "v28.0",
             "lsi_candidates": len(semantic_keyphrases),
         }
     }
@@ -666,14 +665,15 @@ def health():
             "competitor_h2_analysis": True,
             "competitor_word_count": True,
             "full_content_scraping": True,
-            "content_hints_generation": True,
             "oom_protection": True,
             "keyword_alias_support": True,
             # v28.0: Entity SEO
             "entity_seo_enabled": ENTITY_SEO_ENABLED,
             "entity_extraction": ENTITY_SEO_ENABLED,
             "topical_coverage": ENTITY_SEO_ENABLED,
-            "entity_relationships": ENTITY_SEO_ENABLED
+            "entity_relationships": ENTITY_SEO_ENABLED,
+            # v28.0: content_hints WYŁĄCZONE (BRAJEN używa serp_analysis)
+            "content_hints_generation": False
         }
     })
 
