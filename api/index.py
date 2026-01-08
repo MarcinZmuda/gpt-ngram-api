@@ -58,9 +58,15 @@ else:
 try:
     from .synthesize_topics import synthesize_topics
     from .generate_compliance_report import generate_compliance_report
+    from .entity_extractor import perform_entity_seo_analysis
 except ImportError:
     from synthesize_topics import synthesize_topics
     from generate_compliance_report import generate_compliance_report
+    from entity_extractor import perform_entity_seo_analysis
+
+# Flag do włączania/wyłączania Entity SEO
+ENTITY_SEO_ENABLED = os.getenv("ENTITY_SEO_ENABLED", "true").lower() == "true"
+print(f"[S1] {'✅' if ENTITY_SEO_ENABLED else '⚠️'} Entity SEO: {'ENABLED' if ENTITY_SEO_ENABLED else 'DISABLED'}")
 
 app = Flask(__name__)
 
@@ -540,6 +546,22 @@ def perform_ngram_analysis():
     # 3️⃣ Content Hints - subtelne wskazówki dla GPT
     content_hints = generate_content_hints(serp_analysis_data, main_keyword)
 
+    # 4️⃣ 🆕 Entity SEO Analysis (v28.0)
+    entity_seo_data = None
+    if ENTITY_SEO_ENABLED and sources:
+        try:
+            print(f"[S1] 🧠 Running Entity SEO analysis...")
+            entity_seo_data = perform_entity_seo_analysis(
+                nlp=nlp,
+                sources=sources,
+                main_keyword=main_keyword,
+                h2_patterns=unique_h2_patterns
+            )
+            print(f"[S1] ✅ Entity SEO: {entity_seo_data.get('entity_seo_summary', {}).get('total_entities', 0)} entities found")
+        except Exception as e:
+            print(f"[S1] ⚠️ Entity SEO error (non-critical): {e}")
+            entity_seo_data = {"error": str(e), "status": "FAILED"}
+
     # ⭐ PEŁNA ODPOWIEDŹ z wszystkimi danymi SERP
     response_payload = {
         "main_keyword": main_keyword,
@@ -558,6 +580,9 @@ def perform_ngram_analysis():
         # ⭐ Content Hints - inspiracje dla GPT
         "content_hints": content_hints,
 
+        # 🆕 Entity SEO (v28.0)
+        "entity_seo": entity_seo_data,
+
         "summary": {
             "total_sources": len(sources),
             "sources_auto_fetched": not bool(data.get("sources", [])),
@@ -567,7 +592,9 @@ def perform_ngram_analysis():
             "related_searches_count": len(related_searches),
             "h2_patterns_found": len(unique_h2_patterns),
             "content_hints_generated": bool(content_hints),
-            "engine": "v27.0",
+            "entity_seo_enabled": ENTITY_SEO_ENABLED,  # 🆕 v28.0
+            "entities_found": entity_seo_data.get("entity_seo_summary", {}).get("total_entities", 0) if entity_seo_data else 0,
+            "engine": "v28.0",  # Updated version
             "lsi_candidates": len(semantic_keyphrases),
         }
     }
@@ -622,7 +649,7 @@ def perform_generate_compliance_report():
 def health():
     return jsonify({
         "status": "ok",
-        "engine": "v27.0",
+        "engine": "v28.0",
         "limits": {
             "max_content_per_page": MAX_CONTENT_SIZE,
             "max_total_content": MAX_TOTAL_CONTENT,
@@ -634,14 +661,19 @@ def health():
             "serpapi_enabled": bool(SERPAPI_KEY),
             "paa_extraction": True,
             "featured_snippet_extraction": True,
-            "ai_overview_extraction": True,  # v27.0: Google SGE
+            "ai_overview_extraction": True,
             "related_searches_extraction": True,
             "competitor_h2_analysis": True,
-            "competitor_word_count": True,  # v27.0
+            "competitor_word_count": True,
             "full_content_scraping": True,
             "content_hints_generation": True,
             "oom_protection": True,
-            "keyword_alias_support": True  # v27.0: accepts both keyword and main_keyword
+            "keyword_alias_support": True,
+            # v28.0: Entity SEO
+            "entity_seo_enabled": ENTITY_SEO_ENABLED,
+            "entity_extraction": ENTITY_SEO_ENABLED,
+            "topical_coverage": ENTITY_SEO_ENABLED,
+            "entity_relationships": ENTITY_SEO_ENABLED
         }
     })
 
