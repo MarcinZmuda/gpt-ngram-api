@@ -45,11 +45,26 @@ SPACY_LABEL_MAP = {
 PRIORITY_ENTITY_TYPES = ["PERSON", "ORGANIZATION", "LOCATION", "DATE"]
 
 # Wzorce do wykrywania relacji (Subject-Verb-Object)
+# 🔧 v32.5: Rozszerzone wzorce - więcej czasowników, małe litery też
 RELATION_PATTERNS = [
+    # Podstawowe wzorce z wielkiej litery
     (r'(\b[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+(?:\s+[A-ZĄĆĘŁŃÓŚŹŻ]?[a-ząćęłńóśźż]+)?)\s+(oferuje|zapewnia|umożliwia|pozwala|daje|gwarantuje)\s+([a-ząćęłńóśźż\s]+)', "offers"),
     (r'(\b[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(wymaga|potrzebuje|obliguje)\s+([a-ząćęłńóśźż\s]+)', "requires"),
     (r'(\b[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+)\s+(wpływa na|oddziałuje na|determinuje)\s+([a-ząćęłńóśźż\s]+)', "affects"),
     (r'(\b[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+)\s+(reguluje|kontroluje|nadzoruje)\s+([a-ząćęłńóśźż\s]+)', "regulates"),
+    
+    # 🆕 Wzorce z małej litery (częste w tekstach SEO)
+    (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(wspiera|wspomaga|pomaga|ułatwia)\s+([a-ząćęłńóśźż\s]+)', "supports"),
+    (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(chroni|zabezpiecza|ochrania)\s+([a-ząćęłńóśźż\s]+)', "protects"),
+    (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(poprawia|ulepsza|zwiększa|podnosi)\s+([a-ząćęłńóśźż\s]+)', "improves"),
+    (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(zawiera|posiada|ma w składzie)\s+([a-ząćęłńóśźż\s]+)', "contains"),
+    (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(redukuje|zmniejsza|obniża|ogranicza)\s+([a-ząćęłńóśźż\s]+)', "reduces"),
+    (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(powoduje|wywołuje|skutkuje|prowadzi do)\s+([a-ząćęłńóśźż\s]+)', "causes"),
+    
+    # 🆕 Wzorce specyficzne dla branż
+    (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(leczy|łagodzi|eliminuje)\s+([a-ząćęłńóśźż\s]+)', "treats"),  # medycyna
+    (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(kosztuje|wymaga opłaty|wyceniano na)\s+([a-ząćęłńóśźż\s0-9]+)', "costs"),  # finanse
+    (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(trwa|zajmuje|wymaga czasu)\s+([a-ząćęłńóśźż\s0-9]+)', "duration"),  # czas
 ]
 
 
