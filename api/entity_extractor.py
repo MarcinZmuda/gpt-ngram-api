@@ -262,6 +262,23 @@ def extract_entity_relationships(
     combined_text = " ".join(texts)[:100000]
     entity_names = {e.text.lower() for e in entities}
     
+    # 🆕 v32.6: Dodaj też główne słowa z tekstu (nie tylko NER entities)
+    # Wyciągnij częste rzeczowniki z tekstu jako "pseudo-entities"
+    common_nouns = set()
+    words = combined_text.lower().split()
+    word_freq = {}
+    for w in words:
+        if len(w) > 4:  # tylko słowa > 4 znaków
+            word_freq[w] = word_freq.get(w, 0) + 1
+    # Top 50 najczęstszych słów
+    for word, freq in sorted(word_freq.items(), key=lambda x: -x[1])[:50]:
+        if freq >= 2:
+            common_nouns.add(word)
+    
+    # Połącz NER entities z common nouns
+    all_relevant_terms = entity_names | common_nouns
+    print(f"[ENTITY] 📊 Relevant terms for relationships: {len(entity_names)} NER + {len(common_nouns)} common = {len(all_relevant_terms)}")
+    
     relationships = defaultdict(lambda: {"frequency": 0})
     
     for pattern, rel_type in RELATION_PATTERNS:
@@ -276,11 +293,12 @@ def extract_entity_relationships(
                 subj_lower = subject.lower()
                 obj_lower = obj.lower()
                 
+                # 🔧 v32.6 FIX: Używaj all_relevant_terms (NER + common nouns)
                 is_relevant = (
-                    subj_lower in entity_names or 
-                    obj_lower in entity_names or
-                    any(e in subj_lower for e in entity_names) or
-                    any(e in obj_lower for e in entity_names)
+                    subj_lower in all_relevant_terms or 
+                    obj_lower in all_relevant_terms or
+                    any(e in subj_lower for e in all_relevant_terms if len(e) > 4) or
+                    any(e in obj_lower for e in all_relevant_terms if len(e) > 4)
                 )
                 
                 if is_relevant and len(subject) > 2 and len(obj) > 2:
