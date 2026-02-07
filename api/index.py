@@ -68,6 +68,30 @@ except ImportError:
 ENTITY_SEO_ENABLED = os.getenv("ENTITY_SEO_ENABLED", "true").lower() == "true"
 print(f"[S1] {'✅' if ENTITY_SEO_ENABLED else '⚠️'} Entity SEO: {'ENABLED' if ENTITY_SEO_ENABLED else 'DISABLED'}")
 
+# 🆕 v45.0: Causal Triplet Extractor
+CAUSAL_EXTRACTOR_ENABLED = False
+try:
+    try:
+        from .causal_extractor import extract_causal_triplets, format_causal_for_agent
+    except ImportError:
+        from causal_extractor import extract_causal_triplets, format_causal_for_agent
+    CAUSAL_EXTRACTOR_ENABLED = True
+    print("[S1] ✅ Causal Triplet Extractor v1.0 enabled")
+except ImportError:
+    print("[S1] ℹ️ Causal Triplet Extractor not available")
+
+# 🆕 v45.0: Gap Analyzer
+GAP_ANALYZER_ENABLED = False
+try:
+    try:
+        from .gap_analyzer import analyze_content_gaps
+    except ImportError:
+        from gap_analyzer import analyze_content_gaps
+    GAP_ANALYZER_ENABLED = True
+    print("[S1] ✅ Gap Analyzer v1.0 enabled")
+except ImportError:
+    print("[S1] ℹ️ Gap Analyzer not available")
+
 app = Flask(__name__)
 
 # ======================================================
@@ -562,6 +586,44 @@ def perform_ngram_analysis():
             print(f"[S1] ⚠️ Entity SEO error (non-critical): {e}")
             entity_seo_data = {"error": str(e), "status": "FAILED"}
 
+    # 5️⃣ 🆕 Causal Triplet Extraction (v45.0)
+    causal_data = None
+    if CAUSAL_EXTRACTOR_ENABLED and sources:
+        try:
+            print(f"[S1] 🔗 Running Causal Triplet Extraction...")
+            causal_triplets = extract_causal_triplets(
+                texts=[s.get("content", "") for s in sources],
+                main_keyword=main_keyword
+            )
+            causal_data = {
+                "count": len(causal_triplets),
+                "chains": [t.to_dict() for t in causal_triplets if t.is_chain],
+                "singles": [t.to_dict() for t in causal_triplets if not t.is_chain],
+                "agent_instruction": format_causal_for_agent(causal_triplets, main_keyword)
+            }
+            print(f"[S1] ✅ Causal Triplets: {len(causal_triplets)} found "
+                  f"({sum(1 for t in causal_triplets if t.is_chain)} chains)")
+        except Exception as e:
+            print(f"[S1] ⚠️ Causal extraction error (non-critical): {e}")
+            causal_data = {"error": str(e), "status": "FAILED"}
+
+    # 6️⃣ 🆕 Content Gap Analysis (v45.0)
+    content_gaps_data = None
+    if GAP_ANALYZER_ENABLED and sources:
+        try:
+            print(f"[S1] 📊 Running Gap Analysis...")
+            content_gaps_data = analyze_content_gaps(
+                competitor_texts=[s.get("content", "") for s in sources],
+                competitor_h2s=unique_h2_patterns,
+                paa_questions=paa_questions,
+                related_searches=related_searches,
+                main_keyword=main_keyword
+            )
+            print(f"[S1] ✅ Content Gaps: {content_gaps_data.get('total_gaps', 0)} gaps found")
+        except Exception as e:
+            print(f"[S1] ⚠️ Gap Analysis error (non-critical): {e}")
+            content_gaps_data = {"error": str(e), "status": "FAILED"}
+
     # ⭐ PEŁNA ODPOWIEDŹ z wszystkimi danymi SERP
     response_payload = {
         "main_keyword": main_keyword,
@@ -583,6 +645,12 @@ def perform_ngram_analysis():
         # 🆕 Entity SEO (v28.0)
         "entity_seo": entity_seo_data,
 
+        # 🆕 Causal Triplets (v45.0)
+        "causal_triplets": causal_data,
+
+        # 🆕 Content Gaps (v45.0)
+        "content_gaps": content_gaps_data,
+
         "summary": {
             "total_sources": len(sources),
             "sources_auto_fetched": not bool(data.get("sources", [])),
@@ -593,6 +661,8 @@ def perform_ngram_analysis():
             "h2_patterns_found": len(unique_h2_patterns),
             "entity_seo_enabled": ENTITY_SEO_ENABLED,
             "entities_found": entity_seo_data.get("entity_seo_summary", {}).get("total_entities", 0) if entity_seo_data else 0,
+            "causal_triplets_found": causal_data.get("count", 0) if causal_data else 0,
+            "content_gaps_found": content_gaps_data.get("total_gaps", 0) if content_gaps_data else 0,
             "engine": "v28.0",
             "lsi_candidates": len(semantic_keyphrases),
         }
@@ -673,7 +743,10 @@ def health():
             "topical_coverage": ENTITY_SEO_ENABLED,
             "entity_relationships": ENTITY_SEO_ENABLED,
             # v28.0: content_hints WYŁĄCZONE (BRAJEN używa serp_analysis)
-            "content_hints_generation": False
+            "content_hints_generation": False,
+            # v45.0: Causal Triplets + Gap Analysis
+            "causal_triplets_enabled": CAUSAL_EXTRACTOR_ENABLED,
+            "gap_analysis_enabled": GAP_ANALYZER_ENABLED,
         }
     })
 
