@@ -388,15 +388,46 @@ def fetch_serp_sources(keyword, num_results=10):
                     h2_clean = [re.sub(r'<[^>]+>', '', h).strip() for h in h2_tags]
                     h2_clean = [h for h in h2_clean if h and len(h) < 200]  # ⭐ v22.3: Skip too long H2
 
-                    # Usuń script, style, nav, footer, header
+                    # ═══ FAZA 1: Usuń bloki które NIGDY nie zawierają treści ═══
                     content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL | re.IGNORECASE)
                     content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                    content = re.sub(r'<noscript[^>]*>.*?</noscript>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                    content = re.sub(r'<template[^>]*>.*?</template>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                    content = re.sub(r'<svg[^>]*>.*?</svg>', '', content, flags=re.DOTALL | re.IGNORECASE)
                     content = re.sub(r'<nav[^>]*>.*?</nav>', '', content, flags=re.DOTALL | re.IGNORECASE)
                     content = re.sub(r'<footer[^>]*>.*?</footer>', '', content, flags=re.DOTALL | re.IGNORECASE)
                     content = re.sub(r'<header[^>]*>.*?</header>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                    # Usuń wszystkie tagi HTML
+                    content = re.sub(r'<iframe[^>]*>.*?</iframe>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                    content = re.sub(r'<!--.*?-->', '', content, flags=re.DOTALL)
+                    
+                    # ═══ FAZA 2: Usuń tagi HTML (zachowaj tekst między tagami) ═══
                     content = re.sub(r'<[^>]+>', ' ', content)
-                    # Usuń wielokrotne spacje
+                    
+                    # ═══ FAZA 3: Wyczyść wyciekły CSS/JS (kluczowe!) ═══
+                    # CSS bloki: .class{...} @media{...} itp
+                    content = re.sub(r'[\.\#][a-zA-Z_][\w\-]*\s*\{[^}]*\}', ' ', content)
+                    # @media, @keyframes, @font-face itd z zagnieżdżonymi klamrami
+                    content = re.sub(r'@(?:media|keyframes|font-face|import|charset|supports)[^{]*\{[^}]*(?:\{[^}]*\}[^}]*)*\}', ' ', content, flags=re.IGNORECASE)
+                    # Pozostałe bloki CSS z klamrami
+                    content = re.sub(r'\{[^}]{0,500}\}', ' ', content)
+                    # CSS properties: display:flex; align-items:center; itp
+                    content = re.sub(r'(?:[\w-]+\s*:\s*[\w#\-,.\s%()]+;\s*){2,}', ' ', content)
+                    # Izolowane CSS wartości: 0px, 1.5rem, #fff, rgb(...) itp
+                    content = re.sub(r'\b\d+(?:\.\d+)?(?:px|rem|em|vh|vw|%)\b', ' ', content)
+                    content = re.sub(r'#[0-9a-fA-F]{3,8}\b', ' ', content)
+                    content = re.sub(r'rgba?\([^)]+\)', ' ', content)
+                    # CSS selectors: .rp-xxx, .is-active itp
+                    content = re.sub(r'\.[\w][\w\-]{2,}\b', ' ', content)
+                    # !important, var(--)
+                    content = re.sub(r'!important', ' ', content, flags=re.IGNORECASE)
+                    content = re.sub(r'var\(--[\w-]+\)', ' ', content)
+                    # JavaScript artifacts
+                    content = re.sub(r'(?:function|const|let|var|return|if|else|for|while)\s*[\({]', ' ', content)
+                    content = re.sub(r'=>', ' ', content)
+                    # HTML entities
+                    content = re.sub(r'&(?:amp|lt|gt|quot|nbsp|#\d+|#x[\da-fA-F]+);', ' ', content)
+                    
+                    # ═══ FAZA 4: Finalne czyszczenie ═══
                     content = re.sub(r'\s+', ' ', content).strip()
                     
                     # ⭐ v22.3: Final content limit
