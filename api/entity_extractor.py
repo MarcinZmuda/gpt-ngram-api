@@ -18,6 +18,32 @@ from collections import Counter, defaultdict
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 
+# 🆕 v1.1: CSS garbage filter — prevent spaCy NER from picking up CSS pseudo-selectors
+_CSS_ENTITY_BLACKLIST = {
+    "where", "not", "root", "before", "after", "hover", "focus", "active",
+    "first", "last", "nth", "checked", "disabled", "visited", "link",
+    "inline", "block", "flex", "grid", "none", "auto", "inherit",
+    "bold", "normal", "italic", "center", "wrap", "hidden", "visible",
+    "relative", "absolute", "fixed", "static", "transparent", "solid",
+    "pointer", "default", "button", "input", "label", "footer", "header",
+    "widget", "sidebar", "container", "wrapper", "content", "section",
+}
+
+def _is_entity_garbage(text):
+    """Check if entity text is CSS/JS artifact."""
+    if not text or len(text) < 2:
+        return True
+    t = text.strip().lower()
+    if t in _CSS_ENTITY_BLACKLIST:
+        return True
+    if re.search(r'[{};:.]|webkit|moz-|flex-|align-|data-', t, re.IGNORECASE):
+        return True
+    # High special char ratio
+    special = sum(1 for c in t if c in '{}:;()[]<>=#.@_')
+    if len(t) > 0 and special / len(t) > 0.2:
+        return True
+    return False
+
 # ================================================================
 # 📊 KONFIGURACJA
 # ================================================================
@@ -173,102 +199,8 @@ def calculate_entity_importance(entity: ExtractedEntity, total_sources: int) -> 
 
 
 # ================================================================
-# 🧹 FILTR ŚMIECIOWYCH ENCJI (CSS/JS/HTML)
+# 🧠 GŁÓWNE FUNKCJE EKSTRAKCJI
 # ================================================================
-
-# Wzorce identyfikujące śmieciowe "encje" z CSS/JS/HTML
-_CSS_JS_GARBAGE_PATTERNS = [
-    re.compile(r'[{};]'),                      # CSS/JS klamry i średniki
-    re.compile(r'^\d+(?:px|rem|em|vh|%|pt)'),  # Jednostki CSS
-    re.compile(r'^#[0-9a-f]{3,8}$', re.I),     # Kolory hex
-    re.compile(r'^\.[\w-]+$'),                  # CSS class selectors
-    re.compile(r'@media|@keyframes|@font', re.I),  # CSS at-rules
-    re.compile(r'^\w+\([^)]*\)$'),             # CSS functions: rgb(), var(), calc()
-    re.compile(r'(?:webkit|moz|ms)-'),          # Vendor prefixes
-    re.compile(r'^(?:none|auto|inherit|initial|unset|block|inline|flex|grid|absolute|relative|fixed|static)$', re.I),  # CSS values
-]
-
-# Tokeny CSS/JS/HTML które dyskwalifikują encję
-_GARBAGE_TOKENS = {
-    'align', 'center', 'flex', 'grid', 'block', 'inline', 'display', 'position',
-    'margin', 'padding', 'border', 'width', 'height', 'background', 'color',
-    'font', 'text', 'overflow', 'opacity', 'transform', 'transition', 'animation',
-    'hover', 'active', 'focus', 'before', 'after', 'first', 'last', 'nth',
-    'webkit', 'moz', 'important', 'none', 'auto', 'inherit', 'wrap', 'nowrap',
-    'column', 'row', 'start', 'end', 'space', 'between', 'around', 'stretch',
-    'relative', 'absolute', 'fixed', 'sticky', 'static', 'hidden', 'visible',
-    'solid', 'dashed', 'dotted', 'transparent', 'rgba', 'linear', 'gradient',
-    'min', 'max', 'calc', 'var', 'undefined', 'null', 'true', 'false',
-    'function', 'return', 'const', 'script', 'style', 'class', 'onclick',
-}
-
-
-def is_garbage_entity(text: str) -> bool:
-    """
-    Sprawdza czy tekst encji to śmieć z CSS/JS/HTML.
-    Zwraca True jeśli encja powinna być odrzucona.
-    """
-    if not text or len(text) < 2:
-        return True
-    
-    # 1. Wzorce CSS/JS
-    for pattern in _CSS_JS_GARBAGE_PATTERNS:
-        if pattern.search(text):
-            return True
-    
-    # 2. Tokeny CSS/JS — jeśli >50% tokenów encji to CSS
-    tokens = text.lower().split()
-    if tokens:
-        # Dla encji 1-2 tokeny: wystarczy 1 garbage token
-        # Dla dłuższych: >50% musi być garbage
-        garbage_count = sum(1 for t in tokens if t.strip('.,;:()') in _GARBAGE_TOKENS)
-        
-        if len(tokens) <= 2 and garbage_count >= len(tokens):
-            return True
-        if len(tokens) > 2 and garbage_count / len(tokens) > 0.5:
-            return True
-    
-    # 3. Zawiera typowe fragmenty CSS
-    text_lower = text.lower()
-    css_fragments = [
-        'align-items', 'justify-content', 'flex-direction', 'box-sizing',
-        'font-size', 'line-height', 'border-radius', 'background-color',
-        'min-width', 'max-width', 'margin-top', 'padding-left',
-        'text-decoration', 'white-space', 'overflow-x', 'z-index',
-        '.rp-', '.is-', '.has-', '.wp-', '.css-', '.sc-', '.MuiSvg',
-        'px;', 'rem;', '%;', ':hover', ':focus', ':active', '::before', '::after',
-    ]
-    if any(frag in text_lower for frag in css_fragments):
-        return True
-    
-    # 4. Zbyt dużo znaków specjalnych (typowe dla kodu)
-    special_chars = sum(1 for c in text if c in '{}[]();:=<>/@#$%^&*|\\~`')
-    if len(text) > 0 and special_chars / len(text) > 0.15:
-        return True
-    
-    # 5. Wygląda jak CSS selector/property: zawiera ";" z ":" (nie jako czas)
-    if ';' in text and ':' in text:
-        return True
-    
-    # 6. Wygląda jak CSS class/id: zawiera "." z cyframi+literami (np. "1014s3m.is")
-    if re.search(r'\b[\w]*\d+[\w]*\.[\w]+', text):
-        return True
-    
-    # 7. Pojedynczy krótki token angielski typowy dla CSS (bulb, icon, wrap, grid...)
-    CSS_SINGLE_TOKENS = {
-        'bulb', 'icon', 'wrap', 'grid', 'flex', 'block', 'card', 'hero',
-        'item', 'link', 'list', 'menu', 'modal', 'tabs', 'badge', 'chip',
-        'slot', 'root', 'void', 'span', 'body', 'main', 'aside', 'input',
-        'label', 'button', 'slider', 'toggle', 'widget', 'container',
-        'wrapper', 'overlay', 'tooltip', 'dropdown', 'sidebar', 'navbar',
-        'footer', 'header', 'section', 'article', 'figure', 'caption',
-    }
-    if text_lower in CSS_SINGLE_TOKENS:
-        return True
-    
-    return False
-
-
 
 def extract_entities(
     nlp,
@@ -308,8 +240,8 @@ def extract_entities(
                 if ent_text.isdigit():
                     continue
                 
-                # 🆕 v1.1: Filtruj śmieciowe encje z CSS/JS/HTML
-                if is_garbage_entity(ent_text):
+                # 🆕 v1.1: Skip CSS garbage entities
+                if _is_entity_garbage(ent_text):
                     continue
                 
                 key = ent_text.lower()
