@@ -9,6 +9,15 @@ import google.generativeai as genai
 import firebase_admin
 from firebase_admin import credentials, firestore
 
+# 🆕 v28.0: trafilatura for clean content extraction (eliminates CSS garbage)
+try:
+    import trafilatura
+    TRAFILATURA_AVAILABLE = True
+    print("[S1] ✅ trafilatura loaded — clean content extraction")
+except ImportError:
+    TRAFILATURA_AVAILABLE = False
+    print("[S1] ⚠️ trafilatura not installed — using regex fallback (may include CSS garbage)")
+
 # ======================================================
 # ⭐ v22.3 LIMITS - zapobieganie OOM
 # ======================================================
@@ -376,59 +385,45 @@ def fetch_serp_sources(keyword, num_results=10):
                 )
 
                 if page_response.status_code == 200:
-                    content = page_response.text
+                    raw_html = page_response.text
                     
                     # ⭐ v22.3: Limit content size PRZED przetwarzaniem
-                    if len(content) > MAX_CONTENT_SIZE * 2:  # Raw HTML jest ~2x większy
-                        print(f"[S1] ⚠️ Content too large ({len(content)} chars), truncating: {url[:40]}")
-                        content = content[:MAX_CONTENT_SIZE * 2]
+                    if len(raw_html) > MAX_CONTENT_SIZE * 2:
+                        print(f"[S1] ⚠️ Content too large ({len(raw_html)} chars), truncating: {url[:40]}")
+                        raw_html = raw_html[:MAX_CONTENT_SIZE * 2]
 
-                    # ⭐ Wyciągnij H2 przed usunięciem tagów
-                    h2_tags = re.findall(r'<h2[^>]*>(.*?)</h2>', content, re.IGNORECASE | re.DOTALL)
+                    # ⭐ Wyciągnij H2 PRZED usunięciem tagów (zawsze regex)
+                    h2_tags = re.findall(r'<h2[^>]*>(.*?)</h2>', raw_html, re.IGNORECASE | re.DOTALL)
                     h2_clean = [re.sub(r'<[^>]+>', '', h).strip() for h in h2_tags]
-                    h2_clean = [h for h in h2_clean if h and len(h) < 200]  # ⭐ v22.3: Skip too long H2
+                    h2_clean = [h for h in h2_clean if h and len(h) < 200 and not re.search(r'[{};]|webkit|moz-|flex-|align-items', h, re.IGNORECASE)]
 
-                    # ═══ FAZA 1: Usuń bloki które NIGDY nie zawierają treści ═══
-                    content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                    content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                    content = re.sub(r'<noscript[^>]*>.*?</noscript>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                    content = re.sub(r'<template[^>]*>.*?</template>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                    content = re.sub(r'<svg[^>]*>.*?</svg>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                    content = re.sub(r'<nav[^>]*>.*?</nav>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                    content = re.sub(r'<footer[^>]*>.*?</footer>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                    content = re.sub(r'<header[^>]*>.*?</header>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                    content = re.sub(r'<iframe[^>]*>.*?</iframe>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                    content = re.sub(r'<!--.*?-->', '', content, flags=re.DOTALL)
+                    # 🆕 v28.0: Ekstrakcja treści — trafilatura (czysta) lub regex (fallback)
+                    content = None
+                    if TRAFILATURA_AVAILABLE:
+                        try:
+                            content = trafilatura.extract(
+                                raw_html,
+                                include_comments=False,
+                                include_tables=True,
+                                no_fallback=False,
+                                favor_precision=True
+                            )
+                            if content:
+                                print(f"[S1] 🧹 trafilatura: {len(content)} chars clean text from {url[:40]}")
+                        except Exception as e:
+                            print(f"[S1] ⚠️ trafilatura failed for {url[:40]}: {e}")
+                            content = None
                     
-                    # ═══ FAZA 2: Usuń tagi HTML (zachowaj tekst między tagami) ═══
-                    content = re.sub(r'<[^>]+>', ' ', content)
-                    
-                    # ═══ FAZA 3: Wyczyść wyciekły CSS/JS (kluczowe!) ═══
-                    # CSS bloki: .class{...} @media{...} itp
-                    content = re.sub(r'[\.\#][a-zA-Z_][\w\-]*\s*\{[^}]*\}', ' ', content)
-                    # @media, @keyframes, @font-face itd z zagnieżdżonymi klamrami
-                    content = re.sub(r'@(?:media|keyframes|font-face|import|charset|supports)[^{]*\{[^}]*(?:\{[^}]*\}[^}]*)*\}', ' ', content, flags=re.IGNORECASE)
-                    # Pozostałe bloki CSS z klamrami
-                    content = re.sub(r'\{[^}]{0,500}\}', ' ', content)
-                    # CSS properties: display:flex; align-items:center; itp
-                    content = re.sub(r'(?:[\w-]+\s*:\s*[\w#\-,.\s%()]+;\s*){2,}', ' ', content)
-                    # Izolowane CSS wartości: 0px, 1.5rem, #fff, rgb(...) itp
-                    content = re.sub(r'\b\d+(?:\.\d+)?(?:px|rem|em|vh|vw|%)\b', ' ', content)
-                    content = re.sub(r'#[0-9a-fA-F]{3,8}\b', ' ', content)
-                    content = re.sub(r'rgba?\([^)]+\)', ' ', content)
-                    # CSS selectors: .rp-xxx, .is-active itp
-                    content = re.sub(r'\.[\w][\w\-]{2,}\b', ' ', content)
-                    # !important, var(--)
-                    content = re.sub(r'!important', ' ', content, flags=re.IGNORECASE)
-                    content = re.sub(r'var\(--[\w-]+\)', ' ', content)
-                    # JavaScript artifacts
-                    content = re.sub(r'(?:function|const|let|var|return|if|else|for|while)\s*[\({]', ' ', content)
-                    content = re.sub(r'=>', ' ', content)
-                    # HTML entities
-                    content = re.sub(r'&(?:amp|lt|gt|quot|nbsp|#\d+|#x[\da-fA-F]+);', ' ', content)
-                    
-                    # ═══ FAZA 4: Finalne czyszczenie ═══
-                    content = re.sub(r'\s+', ' ', content).strip()
+                    # Fallback: regex (stary sposób)
+                    if not content:
+                        content = raw_html
+                        content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                        content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                        content = re.sub(r'<nav[^>]*>.*?</nav>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                        content = re.sub(r'<footer[^>]*>.*?</footer>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                        content = re.sub(r'<header[^>]*>.*?</header>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                        content = re.sub(r'<[^>]+>', ' ', content)
+                        content = re.sub(r'\s+', ' ', content).strip()
                     
                     # ⭐ v22.3: Final content limit
                     content = content[:MAX_CONTENT_SIZE]
