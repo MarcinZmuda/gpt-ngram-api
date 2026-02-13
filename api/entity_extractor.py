@@ -85,27 +85,45 @@ SPACY_LABEL_MAP = {
 # Typy encji ważne dla SEO (priorytetowe)
 PRIORITY_ENTITY_TYPES = ["PERSON", "ORGANIZATION", "LOCATION", "DATE"]
 
-# Wzorce do wykrywania relacji (Subject-Verb-Object)
-# 🔧 v32.5: Rozszerzone wzorce - więcej czasowników, małe litery też
+# 🆕 v2.0: Dependency-based relation extraction (replaces regex RELATION_PATTERNS)
+try:
+    try:
+        from .relation_extractor import extract_entity_relationships as dep_extract_relationships
+    except ImportError:
+        from relation_extractor import extract_entity_relationships as dep_extract_relationships
+    RELATION_V2_ENABLED = True
+    print("[ENTITY] ✅ Dependency-based relation extractor loaded")
+except ImportError:
+    RELATION_V2_ENABLED = False
+    print("[ENTITY] ⚠️ relation_extractor not found, using legacy regex patterns")
+
+# 🆕 v3.0: Entity Salience + Co-occurrence + Placement Instructions
+try:
+    try:
+        from .entity_salience import compute_salience, extract_cooccurrence, generate_placement_instructions
+    except ImportError:
+        from entity_salience import compute_salience, extract_cooccurrence, generate_placement_instructions
+    SALIENCE_ENABLED = True
+    print("[ENTITY] ✅ Entity salience module loaded")
+except ImportError:
+    SALIENCE_ENABLED = False
+    print("[ENTITY] ⚠️ entity_salience not found, salience/co-occurrence disabled")
+
+# Legacy RELATION_PATTERNS — used only if relation_extractor.py is missing
 RELATION_PATTERNS = [
-    # Podstawowe wzorce z wielkiej litery
     (r'(\b[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+(?:\s+[A-ZĄĆĘŁŃÓŚŹŻ]?[a-ząćęłńóśźż]+)?)\s+(oferuje|zapewnia|umożliwia|pozwala|daje|gwarantuje)\s+([a-ząćęłńóśźż\s]+)', "offers"),
     (r'(\b[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(wymaga|potrzebuje|obliguje)\s+([a-ząćęłńóśźż\s]+)', "requires"),
     (r'(\b[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+)\s+(wpływa na|oddziałuje na|determinuje)\s+([a-ząćęłńóśźż\s]+)', "affects"),
     (r'(\b[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+)\s+(reguluje|kontroluje|nadzoruje)\s+([a-ząćęłńóśźż\s]+)', "regulates"),
-    
-    # 🆕 Wzorce z małej litery (częste w tekstach SEO)
     (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(wspiera|wspomaga|pomaga|ułatwia)\s+([a-ząćęłńóśźż\s]+)', "supports"),
     (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(chroni|zabezpiecza|ochrania)\s+([a-ząćęłńóśźż\s]+)', "protects"),
     (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(poprawia|ulepsza|zwiększa|podnosi)\s+([a-ząćęłńóśźż\s]+)', "improves"),
     (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(zawiera|posiada|ma w składzie)\s+([a-ząćęłńóśźż\s]+)', "contains"),
     (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(redukuje|zmniejsza|obniża|ogranicza)\s+([a-ząćęłńóśźż\s]+)', "reduces"),
     (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(powoduje|wywołuje|skutkuje|prowadzi do)\s+([a-ząćęłńóśźż\s]+)', "causes"),
-    
-    # 🆕 Wzorce specyficzne dla branż
-    (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(leczy|łagodzi|eliminuje)\s+([a-ząćęłńóśźż\s]+)', "treats"),  # medycyna
-    (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(kosztuje|wymaga opłaty|wyceniano na)\s+([a-ząćęłńóśźż\s0-9]+)', "costs"),  # finanse
-    (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(trwa|zajmuje|wymaga czasu)\s+([a-ząćęłńóśźż\s0-9]+)', "duration"),  # czas
+    (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(leczy|łagodzi|eliminuje)\s+([a-ząćęłńóśźż\s]+)', "treats"),
+    (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(kosztuje|wymaga opłaty|wyceniano na)\s+([a-ząćęłńóśźż\s0-9]+)', "costs"),
+    (r'(\b[a-ząćęłńóśźż]+(?:\s+[a-ząćęłńóśźż]+)?)\s+(trwa|zajmuje|wymaga czasu)\s+([a-ząćęłńóśźż\s0-9]+)', "duration"),
 ]
 
 
@@ -298,31 +316,56 @@ def extract_entities(
 
 def extract_entity_relationships(
     texts: List[str],
-    entities: List[ExtractedEntity]
+    entities: List[ExtractedEntity],
+    nlp=None,
+    concept_entities: List[Dict] = None,
 ) -> List[EntityRelationship]:
-    """Wykrywa relacje między encjami (rule-based)."""
+    """
+    Wykrywa relacje między encjami.
+    v2.0: Deleguje do dependency parsera jeśli dostępny.
+    Legacy: regex-based (fallback).
+    """
     if not texts or not entities:
         return []
     
+    # ── v2.0: Dependency parser (preferred) ──
+    if RELATION_V2_ENABLED and nlp is not None:
+        try:
+            rel_dicts = dep_extract_relationships(
+                nlp=nlp,
+                texts=texts,
+                entities=entities,
+                concept_entities=concept_entities,
+            )
+            # Konwertuj dicts → EntityRelationship
+            results = []
+            for rd in rel_dicts:
+                results.append(EntityRelationship(
+                    subject=rd.get("subject", ""),
+                    verb=rd.get("verb", ""),
+                    object=rd.get("object", ""),
+                    relation_type=rd.get("type", "relates_to"),
+                    frequency=rd.get("frequency", 1),
+                ))
+            return results
+        except Exception as e:
+            print(f"[ENTITY] ⚠️ Dep parser failed, falling back to regex: {e}")
+    
+    # ── Legacy: regex-based (fallback) ──
     combined_text = " ".join(texts)[:100000]
     entity_names = {e.text.lower() for e in entities}
     
-    # 🆕 v32.6: Dodaj też główne słowa z tekstu (nie tylko NER entities)
-    # Wyciągnij częste rzeczowniki z tekstu jako "pseudo-entities"
     common_nouns = set()
     words = combined_text.lower().split()
     word_freq = {}
     for w in words:
-        if len(w) > 4:  # tylko słowa > 4 znaków
+        if len(w) > 4:
             word_freq[w] = word_freq.get(w, 0) + 1
-    # Top 50 najczęstszych słów
     for word, freq in sorted(word_freq.items(), key=lambda x: -x[1])[:50]:
         if freq >= 2:
             common_nouns.add(word)
     
-    # Połącz NER entities z common nouns
     all_relevant_terms = entity_names | common_nouns
-    print(f"[ENTITY] 📊 Relevant terms for relationships: {len(entity_names)} NER + {len(common_nouns)} common = {len(all_relevant_terms)}")
     
     relationships = defaultdict(lambda: {"frequency": 0})
     
@@ -338,7 +381,6 @@ def extract_entity_relationships(
                 subj_lower = subject.lower()
                 obj_lower = obj.lower()
                 
-                # 🔧 v32.6 FIX: Używaj all_relevant_terms (NER + common nouns)
                 is_relevant = (
                     subj_lower in all_relevant_terms or 
                     obj_lower in all_relevant_terms or
@@ -471,34 +513,16 @@ def perform_entity_seo_analysis(
     
     print(f"[ENTITY] 🔍 Analyzing {len(texts)} sources for: {main_keyword}")
     
-    # 1️⃣ Ekstrakcja encji
+    # 1️⃣ Ekstrakcja encji (NER)
     entities = extract_entities(nlp, texts, urls)
     print(f"[ENTITY] ✅ Extracted {len(entities)} entities")
     
-    # 2️⃣ Relacje między encjami
-    relationships = extract_entity_relationships(texts, entities)
-    print(f"[ENTITY] ✅ Found {len(relationships)} relationships")
-    
-    # 3️⃣ Pokrycie tematyczne
-    h2_list = h2_patterns or []
-    for src in sources:
-        h2_list.extend(src.get("h2_structure", []))
-    
-    topical = analyze_topical_coverage(h2_list, main_keyword, len(sources))
-    print(f"[ENTITY] ✅ Found {len(topical)} topic clusters")
-    
-    # 4️⃣ Podsumowanie
-    persons = [e for e in entities if e.type == "PERSON"]
-    orgs = [e for e in entities if e.type == "ORGANIZATION"]
-    locations = [e for e in entities if e.type == "LOCATION"]
-    must_topics = [t for t in topical if t.priority == "MUST"]
-    
-    # 5️⃣ 🆕 v2.0: Topical/Concept Entities
+    # 2️⃣ 🆕 Topical/Concept Entities (before relationships, so we can feed them)
+    concept_entities = []
     topical_entities_data = {}
-    concept_entities_list = []
     if TOPICAL_ENABLED:
         try:
-            concept_entities = extract_topical_entities(
+            concept_entities_obj = extract_topical_entities(
                 nlp=nlp,
                 texts=texts,
                 urls=urls,
@@ -508,14 +532,94 @@ def perform_entity_seo_analysis(
                 min_sources=1,
             )
             topical_entities_data = generate_topical_summary(
-                entities=concept_entities,
+                entities=concept_entities_obj,
                 main_keyword=main_keyword,
             )
-            concept_entities_list = [e.to_dict() for e in concept_entities]
+            concept_entities = [e.to_dict() for e in concept_entities_obj]
             print(f"[ENTITY] ✅ Topical entities: {len(concept_entities)} concepts found")
         except Exception as e:
             print(f"[ENTITY] ⚠️ Topical entity extraction error: {e}")
             topical_entities_data = {"status": "ERROR", "error": str(e)}
+    
+    # 3️⃣ Relacje między encjami (v2.0: dep parser + concept entities)
+    relationships = extract_entity_relationships(
+        texts, entities, nlp=nlp,
+        concept_entities=concept_entities if concept_entities else None,
+    )
+    print(f"[ENTITY] ✅ Found {len(relationships)} relationships")
+    
+    # 4️⃣ Pokrycie tematyczne
+    h2_list = h2_patterns or []
+    for src in sources:
+        h2_list.extend(src.get("h2_structure", []))
+    
+    topical = analyze_topical_coverage(h2_list, main_keyword, len(sources))
+    print(f"[ENTITY] ✅ Found {len(topical)} topic clusters")
+    
+    # 5️⃣ Podsumowanie
+    persons = [e for e in entities if e.type == "PERSON"]
+    orgs = [e for e in entities if e.type == "ORGANIZATION"]
+    locations = [e for e in entities if e.type == "LOCATION"]
+    must_topics = [t for t in topical if t.priority == "MUST"]
+    
+    concept_entities_list = concept_entities  # already built in step 2
+    
+    # 6️⃣ 🆕 v3.0: Entity Salience + Co-occurrence + Placement Instructions
+    salience_data = []
+    cooccurrence_data = []
+    placement_data = {}
+    
+    if SALIENCE_ENABLED:
+        try:
+            # Collect H1/H2 from sources
+            all_h2 = h2_list if h2_list else []
+            all_h1 = []
+            for src in sources:
+                h1_list_src = src.get("h1_structure", [])
+                if isinstance(h1_list_src, list):
+                    all_h1.extend(h1_list_src)
+                h2_list_src = src.get("h2_structure", [])
+                if isinstance(h2_list_src, list):
+                    all_h2.extend(h2_list_src)
+            
+            # 6a. Salience scoring
+            salience_results = compute_salience(
+                nlp=nlp,
+                texts=texts,
+                urls=urls,
+                entities=entities,
+                h2_patterns=all_h2,
+                h1_patterns=all_h1,
+                main_keyword=main_keyword,
+            )
+            salience_data = [s.to_dict() for s in salience_results[:20]]
+            print(f"[ENTITY] ✅ Salience: computed for {len(salience_results)} entities")
+            
+            # 6b. Co-occurrence pairs
+            cooccurrence_results = extract_cooccurrence(
+                nlp=nlp,
+                texts=texts,
+                entities=entities,
+                max_pairs=20,
+                min_cooccurrences=2,
+            )
+            cooccurrence_data = [p.to_dict() for p in cooccurrence_results]
+            print(f"[ENTITY] ✅ Co-occurrence: {len(cooccurrence_results)} pairs found")
+            
+            # 6c. Placement instructions
+            placement_data = generate_placement_instructions(
+                salience_data=salience_results,
+                cooccurrence_pairs=cooccurrence_results,
+                concept_entities=concept_entities_list,
+                relationships=relationships,
+                main_keyword=main_keyword,
+            )
+            print(f"[ENTITY] ✅ Placement instructions generated")
+            
+        except Exception as e:
+            print(f"[ENTITY] ⚠️ Salience/co-occurrence error: {e}")
+            import traceback
+            traceback.print_exc()
     
     summary = {
         "status": "OK",
@@ -531,7 +635,10 @@ def perform_entity_seo_analysis(
         "top_entities": [e.text for e in entities[:5]],
         "top_concepts": [c.get("text", "") for c in concept_entities_list[:5]],
         "must_cover_topics": [t.subtopic for t in must_topics[:5]],
-        "relationships_found": len(relationships)
+        "relationships_found": len(relationships),
+        "salience_computed": len(salience_data) > 0,
+        "cooccurrence_pairs": len(cooccurrence_data),
+        "primary_entity": salience_data[0].get("entity", "") if salience_data else "",
     }
     
     return {
@@ -540,5 +647,8 @@ def perform_entity_seo_analysis(
         "topical_summary": topical_entities_data,
         "entity_relationships": [r.to_dict() for r in relationships],
         "topical_coverage": [t.to_dict() for t in topical],
+        "entity_salience": salience_data,
+        "entity_cooccurrence": cooccurrence_data,
+        "entity_placement": placement_data,
         "entity_seo_summary": summary
     }
