@@ -357,101 +357,112 @@ def fetch_serp_sources(keyword, num_results=10):
         print(f"[S1] ✅ Found {len(organic_results)} SERP results")
 
         # ⭐ 6. Scrapuj PEŁNĄ treść każdej strony + strukturę H2
-        sources = []
-        total_content_size = 0  # ⭐ v22.3: Track total size
-        
-        for result in organic_results[:num_results]:
-            url = result.get("link", "")
-            title = result.get("title", "")
+        # ⭐ v47.1: Parallel scraping with ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time as _time
+
+        def _scrape_one(item):
+            """Scrape a single URL — runs in thread pool."""
+            url = item.get("link", "")
+            title = item.get("title", "")
             if not url:
-                continue
-            
-            # ⭐ v22.3: Skip duże dokumenty (BIP, PDF, etc.)
+                return None
             if should_skip_url(url):
                 print(f"[S1] ⏭️ Skipping large doc pattern: {url[:50]}...")
-                continue
-            
-            # ⭐ v22.3: Stop jeśli przekroczono total limit
-            if total_content_size >= MAX_TOTAL_CONTENT:
-                print(f"[S1] ⚠️ Total content limit reached ({MAX_TOTAL_CONTENT} chars), stopping scrape")
-                break
+                return None
 
+            t0 = _time.time()
             try:
-                print(f"[S1] 📄 Scraping: {url[:60]}...")
                 page_response = requests.get(
                     url,
-                    timeout=SCRAPE_TIMEOUT,  # ⭐ v22.3: Reduced timeout
+                    timeout=SCRAPE_TIMEOUT,
                     headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
                 )
 
-                if page_response.status_code == 200:
-                    raw_html = page_response.text
-                    
-                    # ⭐ v22.3: Limit content size PRZED przetwarzaniem
-                    if len(raw_html) > MAX_CONTENT_SIZE * 2:
-                        print(f"[S1] ⚠️ Content too large ({len(raw_html)} chars), truncating: {url[:40]}")
-                        raw_html = raw_html[:MAX_CONTENT_SIZE * 2]
+                if page_response.status_code != 200:
+                    print(f"[S1] ⚠️ HTTP {page_response.status_code} from {url[:40]}")
+                    return None
 
-                    # ⭐ Wyciągnij H2 PRZED usunięciem tagów (zawsze regex)
-                    h2_tags = re.findall(r'<h2[^>]*>(.*?)</h2>', raw_html, re.IGNORECASE | re.DOTALL)
-                    h2_clean = [re.sub(r'<[^>]+>', '', h).strip() for h in h2_tags]
-                    h2_clean = [h for h in h2_clean if h and len(h) < 200 and not re.search(r'[{};]|webkit|moz-|flex-|align-items', h, re.IGNORECASE)]
+                raw_html = page_response.text
 
-                    # 🆕 v28.0: Ekstrakcja treści — trafilatura (czysta) lub regex (fallback)
-                    content = None
-                    if TRAFILATURA_AVAILABLE:
-                        try:
-                            content = trafilatura.extract(
-                                raw_html,
-                                include_comments=False,
-                                include_tables=True,
-                                no_fallback=False,
-                                favor_precision=True
-                            )
-                            if content:
-                                print(f"[S1] 🧹 trafilatura: {len(content)} chars clean text from {url[:40]}")
-                        except Exception as e:
-                            print(f"[S1] ⚠️ trafilatura failed for {url[:40]}: {e}")
-                            content = None
-                    
-                    # Fallback: regex (stary sposób)
-                    if not content:
-                        content = raw_html
-                        content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                        content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                        content = re.sub(r'<nav[^>]*>.*?</nav>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                        content = re.sub(r'<footer[^>]*>.*?</footer>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                        content = re.sub(r'<header[^>]*>.*?</header>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                        content = re.sub(r'<[^>]+>', ' ', content)
-                        content = re.sub(r'\s+', ' ', content).strip()
-                    
-                    # ⭐ v22.3: Final content limit
-                    content = content[:MAX_CONTENT_SIZE]
+                # Limit content size PRZED przetwarzaniem
+                if len(raw_html) > MAX_CONTENT_SIZE * 2:
+                    print(f"[S1] ⚠️ Content too large ({len(raw_html)} chars), truncating: {url[:40]}")
+                    raw_html = raw_html[:MAX_CONTENT_SIZE * 2]
 
-                    if len(content) > 500:
-                        # v27.0: Dodaj word_count dla recommended_length
-                        word_count = len(content.split())
-                        
-                        sources.append({
-                            "url": url,
-                            "title": title,
-                            "content": content,
-                            "h2_structure": h2_clean[:15],
-                            "word_count": word_count  # v27.0: dla recommended_length
-                        })
-                        total_content_size += len(content)  # ⭐ v22.3: Track size
-                        print(f"[S1] ✅ Scraped {len(content)} chars ({word_count} words), {len(h2_clean)} H2 from {url[:40]}")
-                    else:
-                        print(f"[S1] ⚠️ Too short content from {url[:40]}")
+                # Wyciągnij H2 PRZED usunięciem tagów
+                h2_tags = re.findall(r'<h2[^>]*>(.*?)</h2>', raw_html, re.IGNORECASE | re.DOTALL)
+                h2_clean = [re.sub(r'<[^>]+>', '', h).strip() for h in h2_tags]
+                h2_clean = [h for h in h2_clean if h and len(h) < 200 and not re.search(r'[{};]|webkit|moz-|flex-|align-items', h, re.IGNORECASE)]
+
+                # Ekstrakcja treści — trafilatura lub regex fallback
+                content = None
+                if TRAFILATURA_AVAILABLE:
+                    try:
+                        content = trafilatura.extract(
+                            raw_html,
+                            include_comments=False,
+                            include_tables=True,
+                            no_fallback=False,
+                            favor_precision=True
+                        )
+                    except Exception as e:
+                        print(f"[S1] ⚠️ trafilatura failed for {url[:40]}: {e}")
+                        content = None
+
+                # Fallback: regex
+                if not content:
+                    content = raw_html
+                    content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                    content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                    content = re.sub(r'<nav[^>]*>.*?</nav>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                    content = re.sub(r'<footer[^>]*>.*?</footer>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                    content = re.sub(r'<header[^>]*>.*?</header>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                    content = re.sub(r'<[^>]+>', ' ', content)
+                    content = re.sub(r'\s+', ' ', content).strip()
+
+                content = content[:MAX_CONTENT_SIZE]
+                elapsed = _time.time() - t0
+
+                if len(content) > 500:
+                    word_count = len(content.split())
+                    print(f"[S1] ✅ Scraped {len(content)} chars ({word_count} words), {len(h2_clean)} H2 from {url[:40]} [{elapsed:.1f}s]")
+                    return {
+                        "url": url,
+                        "title": title,
+                        "content": content,
+                        "h2_structure": h2_clean[:15],
+                        "word_count": word_count
+                    }
+                else:
+                    print(f"[S1] ⚠️ Too short content from {url[:40]}")
+                    return None
 
             except requests.exceptions.Timeout:
                 print(f"[S1] ⏱️ Timeout for {url[:40]} (>{SCRAPE_TIMEOUT}s)")
-                continue
+                return None
             except Exception as e:
                 print(f"[S1] ⚠️ Scrape error for {url[:40]}: {e}")
-                continue
+                return None
 
-        print(f"[S1] ✅ Successfully scraped {len(sources)} sources ({total_content_size} total chars)")
+        # Launch all scrapes in parallel (max 6 threads)
+        scrape_targets = [r for r in organic_results[:num_results] if r.get("link")]
+        t_start = _time.time()
+        print(f"[S1] 🚀 Parallel scraping {len(scrape_targets)} pages...")
+
+        sources = []
+        total_content_size = 0
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {pool.submit(_scrape_one, item): item for item in scrape_targets}
+            for future in as_completed(futures):
+                result = future.result()
+                if result and total_content_size < MAX_TOTAL_CONTENT:
+                    sources.append(result)
+                    total_content_size += len(result["content"])
+
+        t_elapsed = _time.time() - t_start
+        print(f"[S1] ✅ Parallel scrape done: {len(sources)} sources ({total_content_size} chars) in {t_elapsed:.1f}s")
+
 
         return {
             "sources": sources,
