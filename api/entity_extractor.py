@@ -18,8 +18,20 @@ from collections import Counter, defaultdict
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 
-# 🆕 v1.1: CSS garbage filter — prevent spaCy NER from picking up CSS pseudo-selectors
-_CSS_ENTITY_BLACKLIST = {
+# 🆕 v2.0: Comprehensive web garbage filter (auto-generated from CSS/HTML/JS specs)
+try:
+    try:
+        from .web_garbage_filter import is_entity_garbage as _is_entity_garbage_v2, CSS_ENTITY_BLACKLIST
+    except ImportError:
+        from web_garbage_filter import is_entity_garbage as _is_entity_garbage_v2, CSS_ENTITY_BLACKLIST
+    print(f"[ENTITY] ✅ Web garbage filter loaded ({len(CSS_ENTITY_BLACKLIST)} blacklist entries)")
+except ImportError:
+    CSS_ENTITY_BLACKLIST = set()
+    _is_entity_garbage_v2 = None
+    print("[ENTITY] ⚠️ web_garbage_filter not found, using inline fallback")
+
+# Legacy fallback blacklist (used only if web_garbage_filter.py is missing)
+_CSS_ENTITY_BLACKLIST_LEGACY = {
     "where", "not", "root", "before", "after", "hover", "focus", "active",
     "first", "last", "nth", "checked", "disabled", "visited", "link",
     "inline", "block", "flex", "grid", "none", "auto", "inherit",
@@ -30,15 +42,18 @@ _CSS_ENTITY_BLACKLIST = {
 }
 
 def _is_entity_garbage(text):
-    """Check if entity text is CSS/JS artifact."""
+    """Check if entity text is CSS/JS artifact. Delegates to web_garbage_filter if available."""
+    if _is_entity_garbage_v2 is not None:
+        return _is_entity_garbage_v2(text)
+    
+    # Legacy fallback
     if not text or len(text) < 2:
         return True
     t = text.strip().lower()
-    if t in _CSS_ENTITY_BLACKLIST:
+    if t in _CSS_ENTITY_BLACKLIST_LEGACY:
         return True
     if re.search(r'[{};:.]|webkit|moz-|flex-|align-|data-', t, re.IGNORECASE):
         return True
-    # High special char ratio
     special = sum(1 for c in t if c in '{}:;()[]<>=#.@_')
     if len(t) > 0 and special / len(t) > 0.2:
         return True
