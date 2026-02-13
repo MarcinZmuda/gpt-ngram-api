@@ -49,7 +49,24 @@ _STOP_WORDS_PL = {
     "udostępnij", "komentarz", "odpowiedz", "przeczytaj",
 }
 
-# Wzorce garbage (CSS/JS/HTML) w noun chunks
+# ================================================================
+# 🚫 WEB GARBAGE FILTER — import or fallback
+# ================================================================
+
+try:
+    try:
+        from .web_garbage_filter import is_entity_garbage as _is_web_garbage, CSS_ENTITY_BLACKLIST
+    except ImportError:
+        from web_garbage_filter import is_entity_garbage as _is_web_garbage, CSS_ENTITY_BLACKLIST
+    WEB_FILTER_AVAILABLE = True
+    print(f"[TOPICAL] ✅ Web garbage filter loaded ({len(CSS_ENTITY_BLACKLIST)} entries)")
+except ImportError:
+    WEB_FILTER_AVAILABLE = False
+    CSS_ENTITY_BLACKLIST = set()
+    print("[TOPICAL] ⚠️ web_garbage_filter not found, using built-in patterns")
+
+
+# Wzorce garbage (CSS/JS/HTML) w noun chunks — used as fallback
 _GARBAGE_CHUNK_PATTERNS = re.compile(
     r'[{};@#\[\]<>=\\|]|'       # Specjalne znaki CSS/JS
     r'\.ast[-_]|\.wp[-_]|'       # WordPress/Astra CSS
@@ -105,7 +122,11 @@ def _is_chunk_garbage(text: str) -> bool:
     if not text or len(text) < 2:
         return True
     
-    # Garbage pattern check
+    # Use comprehensive filter if available
+    if WEB_FILTER_AVAILABLE and _is_web_garbage(text):
+        return True
+    
+    # Fallback: Garbage pattern check
     if _GARBAGE_CHUNK_PATTERNS.search(text):
         return True
     
