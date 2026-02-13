@@ -428,6 +428,18 @@ def perform_entity_seo_analysis(
 ) -> Dict[str, Any]:
     """Wykonuje analizę Entity SEO."""
     
+    # 🆕 v2.0: Import topical entities
+    try:
+        try:
+            from .topical_entity_extractor import extract_topical_entities, generate_topical_summary
+        except ImportError:
+            from topical_entity_extractor import extract_topical_entities, generate_topical_summary
+        TOPICAL_ENABLED = True
+        print("[ENTITY] ✅ Topical entity extractor loaded")
+    except ImportError as e:
+        TOPICAL_ENABLED = False
+        print(f"[ENTITY] ⚠️ Topical entity extractor not available: {e}")
+    
     texts = [src.get("content", "") for src in sources if src.get("content")]
     urls = [src.get("url", f"source_{i}") for i, src in enumerate(sources)]
     
@@ -466,22 +478,51 @@ def perform_entity_seo_analysis(
     locations = [e for e in entities if e.type == "LOCATION"]
     must_topics = [t for t in topical if t.priority == "MUST"]
     
+    # 5️⃣ 🆕 v2.0: Topical/Concept Entities
+    topical_entities_data = {}
+    concept_entities_list = []
+    if TOPICAL_ENABLED:
+        try:
+            concept_entities = extract_topical_entities(
+                nlp=nlp,
+                texts=texts,
+                urls=urls,
+                main_keyword=main_keyword,
+                max_entities=30,
+                min_frequency=2,
+                min_sources=1,
+            )
+            topical_entities_data = generate_topical_summary(
+                entities=concept_entities,
+                main_keyword=main_keyword,
+            )
+            concept_entities_list = [e.to_dict() for e in concept_entities]
+            print(f"[ENTITY] ✅ Topical entities: {len(concept_entities)} concepts found")
+        except Exception as e:
+            print(f"[ENTITY] ⚠️ Topical entity extraction error: {e}")
+            topical_entities_data = {"status": "ERROR", "error": str(e)}
+    
     summary = {
         "status": "OK",
         "total_entities": len(entities),
+        "total_concepts": len(concept_entities_list),
         "entity_breakdown": {
             "persons": len(persons),
             "organizations": len(orgs),
             "locations": len(locations),
+            "concepts": len(concept_entities_list),
             "other": len(entities) - len(persons) - len(orgs) - len(locations)
         },
         "top_entities": [e.text for e in entities[:5]],
+        "top_concepts": [c.get("text", "") for c in concept_entities_list[:5]],
         "must_cover_topics": [t.subtopic for t in must_topics[:5]],
         "relationships_found": len(relationships)
     }
     
     return {
         "entities": [e.to_dict() for e in entities],
+        "concept_entities": concept_entities_list,
+        "topical_summary": topical_entities_data,
         "entity_relationships": [r.to_dict() for r in relationships],
         "topical_coverage": [t.to_dict() for t in topical],
         "entity_seo_summary": summary
