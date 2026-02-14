@@ -394,6 +394,17 @@ def fetch_serp_sources(keyword, num_results=10):
                 h2_tags = re.findall(r'<h2[^>]*>(.*?)</h2>', raw_html, re.IGNORECASE | re.DOTALL)
                 h2_clean = [re.sub(r'<[^>]+>', '', h).strip() for h in h2_tags]
                 h2_clean = [h for h in h2_clean if h and len(h) < 200 and not re.search(r'[{};]|webkit|moz-|flex-|align-items', h, re.IGNORECASE)]
+                # v49: Filter navigation H2s at scraping time
+                _NAV_H2 = {
+                    "wyszukiwarka", "nawigacja", "moje strony", "mapa serwisu", "mapa strony",
+                    "biuletyn informacji publicznej", "redakcja serwisu", "dostępność",
+                    "nota prawna", "polityka prywatności", "regulamin", "newsletter",
+                    "social media", "archiwum", "logowanie", "rejestracja",
+                    "inne wersje portalu", "kontakt", "o nas", "strona główna",
+                    "menu główne", "szukaj", "przydatne linki", "stopka", "cookie",
+                    "deklaracja dostępności", "komenda miejska",
+                }
+                h2_clean = [h for h in h2_clean if h.strip().lower() not in _NAV_H2 and not any(nav in h.strip().lower() for nav in _NAV_H2 if len(nav) >= 10)]
 
                 # Ekstrakcja treści — trafilatura lub regex fallback
                 content = None
