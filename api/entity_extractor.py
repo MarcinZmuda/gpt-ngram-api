@@ -60,6 +60,122 @@ def _is_entity_garbage(text):
     return False
 
 # ================================================================
+# 🧹 v2.1: TEXT CLEANING BEFORE NER
+# Strips CSS/JS/HTML artifacts from text BEFORE spaCy runs.
+# This eliminates garbage at the source — no downstream filters needed.
+# ================================================================
+
+_CSS_LINE_PATTERNS = re.compile(
+    r'(?i)(?:'
+    # @font-face blocks and CSS at-rules
+    r'@font-face|@import|@media|@keyframes|@charset|@supports'
+    r'|'
+    # CSS property:value patterns
+    r'(?:font-family|font-size|font-weight|font-style|line-height|letter-spacing'
+    r'|display|position|overflow|visibility|opacity|z-index|float|clear'
+    r'|background(?:-color|-image|-position|-size|-repeat)?'
+    r'|border(?:-radius|-color|-width|-style)?'
+    r'|margin(?:-top|-right|-bottom|-left)?'
+    r'|padding(?:-top|-right|-bottom|-left)?'
+    r'|text-(?:align|decoration|transform|indent|shadow|overflow)'
+    r'|color|width|height|max-width|min-width|max-height|min-height'
+    r'|flex(?:-direction|-wrap|-grow|-shrink|-basis)?'
+    r'|grid(?:-template|-column|-row|-area|-gap)?'
+    r'|justify-content|align-items|align-self|align-content'
+    r'|transition|animation|transform|cursor|pointer-events'
+    r'|box-shadow|box-sizing|user-select|appearance'
+    r'|list-style(?:-type|-position|-image)?'
+    r'|white-space|word-break|word-wrap|text-overflow'
+    r')\s*:'
+    r'|'
+    # CSS selectors and class-like patterns
+    r'\.[a-z][\w-]+\s*\{'
+    r'|'
+    # Multiple CSS values on one line
+    r'(?:inherit|initial|unset|none|auto|block|inline|flex|grid|relative|absolute|fixed|sticky)'
+    r'\s*[;,]\s*'
+    r'(?:inherit|initial|unset|none|auto|block|inline|flex|grid|relative|absolute|fixed|sticky)'
+    r'|'
+    # Font stacks
+    r'(?:Menlo|Monaco|Consolas|Courier|Arial|Helvetica|Verdana|Georgia|Tahoma|Trebuchet)'
+    r'\s*[,;]'
+    r'|'
+    # WordPress/CMS class patterns
+    r'(?:wp-|ast-|elementor-|et_pb_|woocommerce|yoast|rankmath)'
+    r'|'
+    # Hex color codes in CSS context
+    r'#[0-9a-fA-F]{3,8}\b'
+    r'|'
+    # URL patterns
+    r'https?://\S+'
+    r'|'
+    # JavaScript patterns
+    r'(?:function\s*\(|\.addEventListener|\.querySelector|document\.|window\.|console\.)'
+    r')'
+)
+
+# Font names that appear as standalone words/lines
+_FONT_LINE_RE = re.compile(
+    r'(?i)^(?:Menlo|Monaco|Consolas|Courier\s+New|Lucida\s+Console|'
+    r'Arial|Helvetica|Verdana|Georgia|Palatino|Tahoma|Trebuchet|'
+    r'Roboto|Open\s+Sans|Lato|Montserrat|Source\s+Sans|Noto\s+Sans|'
+    r'Font\s+Awesome|Material\s+Icons|system-ui|sans-serif|serif|monospace'
+    r')[,;\s]*$'
+)
+
+
+def _clean_text_for_nlp(text: str) -> str:
+    """
+    v2.1: Strip CSS/JS/HTML artifacts from text BEFORE spaCy NER.
+    
+    Runs line-by-line:
+    - Removes lines that are CSS declarations
+    - Removes lines with high special-char ratio
+    - Removes font name lines
+    - Removes encoding artifacts (mojibake)
+    
+    Preserves natural language content.
+    """
+    if not text:
+        return text
+    
+    lines = text.split('\n')
+    clean_lines = []
+    
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            clean_lines.append('')
+            continue
+        
+        # Skip lines matching CSS patterns
+        if _CSS_LINE_PATTERNS.search(stripped):
+            continue
+        
+        # Skip font name lines
+        if _FONT_LINE_RE.match(stripped):
+            continue
+        
+        # Skip lines with too many special chars (>15% for lines, stricter than entity filter)
+        special = sum(1 for c in stripped if c in '{}();:[]<>=#@_+*~^$|\\/`')
+        if len(stripped) > 5 and special / len(stripped) > 0.15:
+            continue
+        
+        # Skip lines that look like CSS declarations (multiple semicolons)
+        if stripped.count(';') >= 3:
+            continue
+        
+        # Skip mojibake lines (2+ encoding artifacts anywhere in line)
+        mojibake_count = len(re.findall(r'Ã[³±¼²ª©]|Å[›‚ˆ¼¡¾]|Ä[™‡…]|Å\x82|Ã\xb3', stripped))
+        if mojibake_count >= 2:
+            continue
+        
+        clean_lines.append(line)
+    
+    return '\n'.join(clean_lines)
+
+
+# ================================================================
 # 📊 KONFIGURACJA
 # ================================================================
 
@@ -259,7 +375,9 @@ def extract_entities(
         if not text or len(text) < 100:
             continue
         
-        text_sample = text[:50000]
+        # v2.1: Clean text BEFORE NER — strips CSS/JS/HTML artifacts
+        text_cleaned = _clean_text_for_nlp(text)
+        text_sample = text_cleaned[:50000]
         
         try:
             doc = nlp(text_sample)
