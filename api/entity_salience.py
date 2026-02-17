@@ -32,6 +32,15 @@ from collections import Counter, defaultdict
 from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import dataclass, field
 
+# v2.1: Import text cleaning to strip CSS before NER
+try:
+    try:
+        from .entity_extractor import _clean_text_for_nlp
+    except ImportError:
+        from entity_extractor import _clean_text_for_nlp
+except ImportError:
+    _clean_text_for_nlp = None  # Fallback: no cleaning
+
 
 # ================================================================
 # 📦 DATA STRUCTURES
@@ -155,7 +164,9 @@ def compute_salience(
         if not text or len(text) < 100:
             continue
         
-        text_sample = text[:50000]
+        # v2.1: Clean text before NER
+        text_clean = _clean_text_for_nlp(text) if _clean_text_for_nlp else text
+        text_sample = text_clean[:50000]
         text_len = len(text_sample)
         
         # Track first positions per source
@@ -338,7 +349,9 @@ def extract_cooccurrence(
         if not text or len(text) < 100:
             continue
         
-        text_sample = text[:50000]
+        # v2.1: Clean text before NER
+        text_clean = _clean_text_for_nlp(text) if _clean_text_for_nlp else text
+        text_sample = text_clean[:50000]
         
         try:
             doc = nlp(text_sample)
