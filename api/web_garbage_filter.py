@@ -688,7 +688,11 @@ def is_entity_garbage(text: str) -> bool:
     1. Exact match w blackliście (O(1) lookup)
     2. Regex pattern matching
     3. Heurystyki (proporcja specjalnych znaków, długość)
-    4. Segment matching (każdy segment słowa)
+    4. Segment matching (semicolon, dash, space, dot, underscore)
+    5. Numeric-heavy
+    6. CamelCase
+    7. Font name detection
+    8. Encoding artifacts
     
     Returns: True jeśli garbage, False jeśli potencjalnie legit
     """
@@ -712,17 +716,22 @@ def is_entity_garbage(text: str) -> bool:
     
     if len(t) > 0:
         special_ratio = special_count / len(t)
-        if special_ratio > 0.12:
+        # v2.1: Lower threshold for short entities (< 20 chars)
+        threshold = 0.08 if len(t) < 20 else 0.12
+        if special_ratio > threshold:
             return True
     
     # ---- LEVEL 4: Segment matching ----
-    # Rozbij na segmenty po separatorach i sprawdź każdy
-    segments = re.split(r'[-_.\s]', t_lower)
+    # v2.1: Split on semicolons too — catches "inherit;color", "display;block"
+    segments = re.split(r'[-_.;\s]', t_lower)
     segments = [s for s in segments if s]
     
     if segments:
         garbage_segments = sum(1 for s in segments if s in CSS_ENTITY_BLACKLIST)
-        if len(segments) > 0 and garbage_segments / len(segments) >= 0.5:
+        # v2.1: If ANY segment is a CSS property/value, flag the whole thing
+        if garbage_segments >= 1 and len(segments) <= 3:
+            return True
+        if len(segments) > 3 and garbage_segments / len(segments) >= 0.4:
             return True
     
     # ---- LEVEL 5: Numeric-heavy ----
@@ -736,9 +745,41 @@ def is_entity_garbage(text: str) -> bool:
         return True
     
     # ---- LEVEL 6: CamelCase code patterns ----
-    # np. "scrollHeight", "getBoundingClientRect", "createElement"
     camel_count = sum(1 for i in range(1, len(t)) if t[i].isupper() and t[i-1].islower())
-    if camel_count >= 2:  # "getBoundingClientRect" = 3 camel transitions
+    if camel_count >= 2:
+        return True
+    
+    # ---- LEVEL 7: Font names ----
+    # v2.1: Common font names that spaCy NER picks up as entities
+    _FONT_NAMES = {
+        "menlo", "monaco", "consolas", "courier", "courier new", "lucida console",
+        "lucida sans", "arial", "helvetica", "verdana", "georgia", "palatino",
+        "garamond", "bookman", "tahoma", "trebuchet", "impact", "comic sans",
+        "times new roman", "segoe ui", "roboto", "open sans", "lato", "montserrat",
+        "source sans", "source code", "fira code", "fira sans", "noto sans",
+        "ubuntu", "droid sans", "liberation", "dejavu", "bitstream",
+        "font awesome", "material icons", "ionicons", "dashicons", "glyphicons",
+        "sf pro", "sf mono", "system-ui", "ui-sans-serif", "ui-serif", "ui-monospace",
+    }
+    if t_lower in _FONT_NAMES:
+        return True
+    # Check if text is a font stack fragment: "Menlo, Monaco" or "Arial sans-serif"
+    if any(font in t_lower for font in _FONT_NAMES if len(font) > 4):
+        return True
+    
+    # ---- LEVEL 8: Encoding artifacts ----
+    # v2.1: Mojibake / broken encoding: "krÃ³tkich", "wÅ‚aÅ›ciwy", "zdjÄ™cie"
+    if re.search(r'[ÃÅ][^\s]{0,3}[ÃÅ]|Ã[³±¼]|Å[›‚ˆ¼]|Ä[™‡]', t):
+        return True
+    
+    # ---- LEVEL 9: Hex color codes ----
+    # v2.1: Standalone hex fragments "A7FF", "FEFC", "FF00"
+    if re.match(r'^[A-Fa-f0-9]{3,8}$', t):
+        return True
+    
+    # ---- LEVEL 10: Truncated sentences ----
+    # v2.1: Text starting with lowercase + comma = fragment: "unkiem, że opiera się..."
+    if re.match(r'^[a-ząćęłńóśźż]{2,8},\s', t):
         return True
     
     return False
