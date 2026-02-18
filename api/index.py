@@ -1,816 +1,1451 @@
-import os
-import json
-import re
-import requests
-from collections import Counter, defaultdict
-from flask import Flask, request, jsonify
-import spacy
-import google.generativeai as genai
-import firebase_admin
-from firebase_admin import credentials, firestore
-
-# 🆕 v28.0: trafilatura for clean content extraction (eliminates CSS garbage)
-try:
-    import trafilatura
-    TRAFILATURA_AVAILABLE = True
-    print("[S1] ✅ trafilatura loaded — clean content extraction")
-except ImportError:
-    TRAFILATURA_AVAILABLE = False
-    print("[S1] ⚠️ trafilatura not installed — using regex fallback (may include CSS garbage)")
-
-# ======================================================
-# ⭐ v22.3 LIMITS - zapobieganie OOM
-# ======================================================
-MAX_CONTENT_SIZE = 30000      # Max 30KB per page (było unlimited → 175KB crash)
-MAX_TOTAL_CONTENT = 200000    # Max 200KB total content
-SCRAPE_TIMEOUT = 8            # 8 sekund timeout per page (było 10)
-SKIP_DOMAINS = ['bip.', '.pdf', 'gov.pl/dana/', '/uploads/files/']  # Skip duże dokumenty
-
-# ======================================================
-# 🔑 SerpAPI Configuration
-# ======================================================
-SERPAPI_KEY = os.getenv("SERPAPI_KEY")
-if SERPAPI_KEY:
-    print("[S1] ✅ SerpAPI key configured")
-else:
-    print("[S1] ⚠️ SERPAPI_KEY not set — auto-fetch disabled")
-
-# ======================================================
-# 🔥 Firebase Initialization (Safe for Render & Local)
-# ======================================================
-if not firebase_admin._apps:
-    cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    try:
-        if cred_path and os.path.exists(cred_path):
-            cred = credentials.Certificate(cred_path)
-            firebase_admin.initialize_app(cred)
-            print(f"[S1] ✅ Firebase initialized from credentials file: {cred_path}")
-        else:
-            firebase_admin.initialize_app()
-            print("[S1] ✅ Firebase initialized with default credentials")
-    except Exception as e:
-        print(f"[S1] ⚠️ Firebase init skipped: {e}")
-
-# ======================================================
-# ⚙️ Gemini (Google Generative AI) Configuration
-# ======================================================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    print("[S1] ✅ Gemini API configured")
-else:
-    print("[S1] ⚠️ GEMINI_API_KEY not set — semantic extraction fallback active")
-
-# ======================================================
-# 🧠 Import local modules (compatible with both local and Render)
-# ======================================================
-try:
-    from .synthesize_topics import synthesize_topics
-    from .generate_compliance_report import generate_compliance_report
-    from .entity_extractor import perform_entity_seo_analysis
-except ImportError:
-    from synthesize_topics import synthesize_topics
-    from generate_compliance_report import generate_compliance_report
-    from entity_extractor import perform_entity_seo_analysis
-
-# Flag do włączania/wyłączania Entity SEO
-ENTITY_SEO_ENABLED = os.getenv("ENTITY_SEO_ENABLED", "true").lower() == "true"
-print(f"[S1] {'✅' if ENTITY_SEO_ENABLED else '⚠️'} Entity SEO: {'ENABLED' if ENTITY_SEO_ENABLED else 'DISABLED'}")
-
-# 🆕 v45.0: Causal Triplet Extractor
-CAUSAL_EXTRACTOR_ENABLED = False
-try:
-    try:
-        from .causal_extractor import extract_causal_triplets, format_causal_for_agent
-    except ImportError:
-        from causal_extractor import extract_causal_triplets, format_causal_for_agent
-    CAUSAL_EXTRACTOR_ENABLED = True
-    print("[S1] ✅ Causal Triplet Extractor v1.0 enabled")
-except ImportError:
-    print("[S1] ℹ️ Causal Triplet Extractor not available")
-
-# 🆕 v45.0: Gap Analyzer
-GAP_ANALYZER_ENABLED = False
-try:
-    try:
-        from .gap_analyzer import analyze_content_gaps
-    except ImportError:
-        from gap_analyzer import analyze_content_gaps
-    GAP_ANALYZER_ENABLED = True
-    print("[S1] ✅ Gap Analyzer v1.0 enabled")
-except ImportError:
-    print("[S1] ℹ️ Gap Analyzer not available")
-
-app = Flask(__name__)
-
-# ======================================================
-# 🧩 Load spaCy model (preinstalled lightweight version)
-# ======================================================
-try:
-    nlp = spacy.load("pl_core_news_sm")
-    print("[S1] ✅ spaCy pl_core_news_sm loaded")
-except OSError:
-    from spacy.cli import download
-    download("pl_core_news_sm")
-    nlp = spacy.load("pl_core_news_sm")
-    print("[S1] ✅ spaCy model downloaded and loaded")
-
-# ======================================================
-# ⭐ v22.3 Helper: Check if URL should be skipped
-# ======================================================
-def should_skip_url(url):
-    """Sprawdza czy URL powinien być pominięty (duże dokumenty, PDF, BIP)."""
-    url_lower = url.lower()
-    for skip_pattern in SKIP_DOMAINS:
-        if skip_pattern in url_lower:
-            return True
-    # Skip jeśli URL kończy się na rozszerzenie pliku
-    if any(url_lower.endswith(ext) for ext in ['.pdf', '.doc', '.docx', '.xls', '.xlsx']):
-        return True
-    return False
-
-# ======================================================
-# 🧠 Helper: Semantic extraction using Gemini Flash
-# ======================================================
-def extract_semantic_tags_gemini(text, top_n=10):
-    """Używa Google Gemini Flash do wyciągnięcia fraz semantycznych."""
-    if not GEMINI_API_KEY or not (text or "").strip():
-        return []
-
-    try:
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        prompt = f"""
-        Jesteś ekspertem SEO. Przeanalizuj poniższy tekst i wypisz {top_n} najważniejszych fraz kluczowych (semantic keywords), które najlepiej oddają jego sens.
-        Zwróć TYLKO listę po przecinku, bez numerowania.
-
-        TEKST: {text[:8000]}...
-        """
-        response = model.generate_content(prompt)
-        keywords = [k.strip() for k in (response.text or "").split(",") if k.strip()]
-        return [{"phrase": kw, "score": 0.95 - (i * 0.02)} for i, kw in enumerate(keywords[:top_n])]
-    except Exception as e:
-        print(f"[S1] ❌ Gemini Semantic Error: {e}")
-        return []
-
-# ======================================================
-# 💡 Helper: Generate Content Hints (inspiracje dla GPT)
-# ======================================================
-def generate_content_hints(serp_analysis, main_keyword):
-    """
-    Przekształca surowe dane SERP w subtelne wskazówki dla GPT.
-    To są INSPIRACJE, nie twarde reguły - GPT ma je traktować jako tło.
-    """
-    hints = {}
-
-    # 1️⃣ INTRO INSPIRATION - z Featured Snippet / AI Overview
-    featured = serp_analysis.get("featured_snippet")
-    if featured and isinstance(featured, dict) and featured.get("answer"):
-        hints["intro_inspiration"] = {
-            "google_promotes": featured.get("answer", "")[:500],
-            "source_type": featured.get("type", "unknown"),
-            "hint": "Google wyróżnia tę odpowiedź w wynikach. Rozważ napisanie lepszego/pełniejszego wstępu który naturalnie odpowiada na to samo pytanie. NIE kopiuj - napisz wartościowszą wersję."
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BRAJEN SEO</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --black: #000000; --mg: #565656; --lg: #9e9e9e; --orange: #fba92c; --white: #ffffff;
+            --bg: #050505; --s1: #0c0c0c; --s2: #111; --s3: #181818; --s4: #1e1e1e;
+            --b1: #1a1a1a; --b2: #252525; --b3: #333;
+            --og: rgba(251,169,44,.08); --og2: rgba(251,169,44,.15); --og3: rgba(251,169,44,.25);
+            --w5: rgba(255,255,255,.05); --w8: rgba(255,255,255,.08); --w12: rgba(255,255,255,.12);
+            --gn: #34d399; --gnd: rgba(52,211,153,.1); --rd: #f87171; --rdd: rgba(248,113,113,.1);
+            --yl: #fbbf24; --yld: rgba(251,191,36,.1);
+            --r: 12px; --rs: 8px; --rl: 16px;
         }
+        *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+        body{font-family:'Outfit',sans-serif;background:var(--bg);color:var(--white);min-height:100vh;-webkit-font-smoothing:antialiased;overflow:hidden}
+        ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--b2);border-radius:3px}::-webkit-scrollbar-thumb:hover{background:var(--b3)}
 
-    # 2️⃣ QUESTIONS USERS ASK - z PAA
-    paa = serp_analysis.get("paa_questions", [])
-    if paa:
-        questions = [q.get("question", "") for q in paa if isinstance(q, dict) and q.get("question")][:6]
-        hints["questions_users_ask"] = {
-            "questions": questions,
-            "hint": "Użytkownicy często pytają o te rzeczy. Jeśli pasują do tematu, rozważ naturalne poruszenie w treści. Nie musisz odpowiadać na wszystkie - wybierz relevantne."
+        /* ═══ HEADER ═══ */
+        .hd{display:flex;align-items:center;justify-content:space-between;padding:0 28px;height:52px;background:var(--black);border-bottom:1px solid var(--b1);backdrop-filter:blur(20px);position:relative;z-index:99}
+        .hd::after{content:'';position:absolute;bottom:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--orange),transparent);opacity:.15}
+        .hd-l{display:flex;align-items:center;gap:12px}
+        .hd-l h1{font-size:15px;font-weight:700;letter-spacing:-.4px}
+        .hd-l h1 b{color:var(--orange);font-weight:800}
+        .hd-badge{font-size:9px;color:var(--orange);background:var(--og);padding:3px 10px;border-radius:99px;font-weight:600;letter-spacing:.8px;border:1px solid rgba(251,169,44,.15)}
+        .hd-r{display:flex;align-items:center;gap:14px;font-size:12px;color:var(--lg)}
+        .hd-r a{color:var(--lg);text-decoration:none;transition:color .15s}
+        .hd-r a:hover{color:var(--orange)}
+
+        /* ═══ LAYOUT ═══ */
+        .layout{display:grid;grid-template-columns:360px 1fr;height:calc(100vh - 52px)}
+        @media(max-width:960px){.layout{grid-template-columns:1fr}}
+
+        /* ═══ SIDEBAR ═══ */
+        .sidebar{padding:24px 20px;border-right:1px solid var(--b1);overflow-y:auto;background:var(--s1)}
+        .lbl{font-size:10px;font-weight:600;color:var(--lg);text-transform:uppercase;letter-spacing:1.5px;margin:20px 0 8px}
+        .lbl:first-child{margin-top:0}
+        input[type="text"],textarea{
+            width:100%;padding:10px 14px;background:var(--s2);border:1px solid var(--b1);
+            border-radius:var(--rs);color:var(--white);font-size:13px;font-family:inherit;
+            outline:none;transition:all .2s
         }
+        input::placeholder,textarea::placeholder{color:var(--mg)}
+        input:focus,textarea:focus{border-color:rgba(251,169,44,.4);box-shadow:0 0 0 3px var(--og)}
+        textarea{resize:vertical;min-height:72px;line-height:1.5}
+        .hint{font-size:10px;color:var(--mg);margin-top:5px;line-height:1.5}
+        .modes{display:flex;gap:6px;margin-bottom:12px}
+        .mbtn{
+            flex:1;padding:12px 8px;background:var(--s2);border:1px solid var(--b1);
+            border-radius:var(--rs);color:var(--mg);cursor:pointer;text-align:center;
+            transition:all .2s;font-family:inherit
+        }
+        .mbtn.on{border-color:var(--orange);color:var(--orange);background:var(--og)}
+        .mbtn:hover:not(.on){border-color:var(--b3);background:var(--s3)}
+        .ebtn{
+            flex:1;padding:12px 8px;background:var(--s2);border:1px solid var(--b1);
+            border-radius:var(--rs);color:var(--mg);cursor:pointer;text-align:center;
+            transition:all .2s;font-family:inherit
+        }
+        .ebtn.on{border-color:var(--orange);color:var(--orange);background:var(--og)}
+        .ebtn:hover:not(.on){border-color:var(--b3);background:var(--s3)}
+        .ebtn.unavailable{opacity:.4;pointer-events:none}
+        .ebtn.unavailable small::after{content:' (brak klucza)';color:var(--mg)}
+        .mbtn strong{display:block;font-size:13px;font-weight:600;margin-bottom:2px}
+        .mbtn small{font-size:10px;color:var(--mg)}
+        .btn-go{
+            width:100%;padding:12px;margin-top:20px;
+            background:var(--orange);color:var(--black);border:none;border-radius:var(--rs);
+            font-size:13px;font-weight:700;font-family:inherit;cursor:pointer;
+            letter-spacing:-.2px;transition:all .2s;position:relative;overflow:hidden
+        }
+        .btn-go:hover{filter:brightness(1.08);transform:translateY(-1px);box-shadow:0 8px 24px rgba(251,169,44,.2)}
+        .btn-go:disabled{opacity:.35;cursor:not-allowed;transform:none;box-shadow:none;filter:none}
+        .btn-go::after{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.15),transparent);transform:translateX(-100%);transition:transform .5s}
+        .btn-go:hover::after{transform:translateX(100%)}
+        .btn-stop{
+            width:100%;padding:12px;margin-top:6px;
+            background:var(--rdd);color:var(--rd);border:1px solid rgba(248,113,113,.15);
+            border-radius:var(--rs);font-size:13px;font-weight:600;font-family:inherit;
+            cursor:pointer;transition:all .15s;display:none
+        }
+        .btn-stop:hover{background:rgba(248,113,113,.18)}
+        .tbtn{background:none;border:none;color:var(--mg);font-size:10px;cursor:pointer;font-family:inherit;letter-spacing:.5px;text-transform:uppercase}
+        .tbtn:hover{color:var(--orange)}
 
-        # Bonus: krótkie odpowiedzi jako kontekst
-        qa_context = []
-        for q in paa[:3]:
-            if isinstance(q, dict) and q.get("question") and q.get("answer"):
-                qa_context.append({
-                    "q": q.get("question"),
-                    "current_answer": (q.get("answer", "") or "")[:200]
+        /* ═══ MAIN ═══ */
+        .main{padding:24px 28px;overflow-y:auto;background:var(--bg)}
+
+        .welcome{text-align:center;padding:80px 20px}
+        .w-icon{
+            width:56px;height:56px;border-radius:14px;
+            background:linear-gradient(135deg,var(--og2),var(--og));
+            display:inline-flex;align-items:center;justify-content:center;
+            font-size:24px;margin-bottom:18px;border:1px solid rgba(251,169,44,.12)
+        }
+        .welcome h2{font-size:18px;font-weight:700;margin-bottom:6px;letter-spacing:-.4px}
+        .welcome p{color:var(--mg);font-size:13px;line-height:1.6}
+
+        /* ═══ STEPS ═══ */
+        .steps{margin-bottom:24px}
+        .stp{display:flex;align-items:center;gap:12px;padding:9px 0}
+        .stp+.stp{border-top:1px solid var(--w5)}
+        .stp-i{
+            width:28px;height:28px;border-radius:var(--rs);display:flex;align-items:center;
+            justify-content:center;font-size:11px;font-weight:700;flex-shrink:0;transition:all .3s
+        }
+        .stp-i.pending{background:var(--s3);color:var(--mg)}
+        .stp-i.running{background:var(--og);color:var(--orange);animation:blink 1.8s ease-in-out infinite}
+        .stp-i.done{background:var(--gnd);color:var(--gn)}
+        .stp-i.warning{background:var(--yld);color:var(--yl)}
+        .stp-i.error{background:var(--rdd);color:var(--rd)}
+        @keyframes blink{0%,100%{opacity:1}50%{opacity:.5}}
+        .stp-n{font-size:12px;font-weight:500;color:var(--white);flex:1}
+        .stp-d{font-size:10px;color:var(--mg);margin-top:1px}
+
+        /* ═══ CARDS ═══ */
+        .crd{background:var(--s1);border:1px solid var(--b1);border-radius:var(--rl);padding:18px;margin:12px 0;position:relative;overflow:hidden}
+        .crd::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--b2),transparent)}
+        .crd-t{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;color:var(--lg);margin-bottom:14px}
+        .crd-t b{color:var(--orange)}
+
+        .sg{display:grid;gap:8px;margin-top:12px}
+        .sg3{grid-template-columns:repeat(3,1fr)}.sg4{grid-template-columns:repeat(4,1fr)}
+        .sc{text-align:center;padding:12px 6px;background:var(--s2);border-radius:var(--r);border:1px solid var(--b1)}
+        .sv{font-size:20px;font-weight:800;color:var(--white);letter-spacing:-.8px}.sv.xl{font-size:40px}
+        .sv span{font-size:14px;color:var(--mg);font-weight:400}
+        .sl{font-size:9px;color:var(--mg);margin-top:3px;text-transform:uppercase;letter-spacing:.5px}
+
+        /* ═══ PROGRESS ═══ */
+        .pg-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+        .pg-lbl{font-size:12px;font-weight:500;color:var(--white)}
+        .pg-ct{font-size:12px;font-weight:700;color:var(--orange);font-family:'JetBrains Mono',monospace}
+        .pg-bar{width:100%;height:3px;background:var(--s3);border-radius:2px;overflow:hidden}
+        .pg-fill{height:100%;background:linear-gradient(90deg,var(--orange),#fcd34d);border-radius:2px;transition:width .5s ease;box-shadow:0 0 8px rgba(251,169,44,.3)}
+        .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:12px}
+        .bchip{padding:4px 12px;border-radius:99px;font-size:10px;font-weight:600;font-family:'JetBrains Mono',monospace;letter-spacing:.3px}
+        .bchip.pend{background:var(--s3);color:var(--mg);border:1px solid var(--b1)}
+        .bchip.ok{background:var(--gnd);color:var(--gn);border:1px solid rgba(52,211,153,.2)}
+        .bchip.bad{background:var(--rdd);color:var(--rd);border:1px solid rgba(248,113,113,.2)}
+
+        /* ═══ COLLAPSIBLE ═══ */
+        .pnl{background:var(--s1);border:1px solid var(--b1);border-radius:var(--rl);margin:12px 0;overflow:hidden}
+        .pnl-h{padding:13px 18px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;font-weight:600;font-size:12px;color:var(--white);transition:background .12s;user-select:none}
+        .pnl-h:hover{background:var(--w5)}
+        .pnl-h .arr{color:var(--mg);transition:transform .25s;font-size:10px}
+        .pnl-h.open .arr{transform:rotate(180deg)}
+        .pnl-b{display:none;padding:0 18px 16px;font-size:11px;color:rgba(255,255,255,.7);line-height:1.65;max-height:700px;overflow-y:auto}
+        .pnl-b.open{display:block}
+        .sec{margin:10px 0;padding:10px 0;border-top:1px solid var(--w5)}.sec:first-child{border-top:none}
+        .sec-t{font-weight:700;font-size:10px;color:var(--orange);text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px}
+        .tag{display:inline-flex;align-items:center;padding:3px 10px;border-radius:99px;font-size:10px;margin:2px;font-weight:500;gap:4px}
+        .tag.g{background:var(--gnd);color:var(--gn)}.tag.r{background:var(--rdd);color:var(--rd)}
+        .tag.w{background:var(--yld);color:var(--yl)}.tag.o{background:var(--og);color:var(--orange)}
+        .tag.d{background:var(--w5);color:var(--lg)}.tag.p{background:var(--og);color:var(--orange)}
+        .tag.c{background:var(--w8);color:var(--white)}.tag.pk{background:rgba(251,169,44,.06);color:var(--lg)}
+        .chip{display:inline-block;padding:3px 8px;margin:2px;background:var(--s3);border:1px solid var(--b1);border-radius:4px;font-size:10px;color:rgba(255,255,255,.7);font-family:'JetBrains Mono',monospace}
+        .chip.must{border-color:var(--rd);color:var(--rd);background:var(--rdd)}
+        .chip.ext{border-color:var(--orange);color:var(--orange);background:var(--og)}
+        .chip.stop{border-color:var(--b2);color:var(--mg);text-decoration:line-through}
+
+        .bd{background:var(--s2);border:1px solid var(--b1);border-radius:var(--r);padding:12px;margin:6px 0}
+        .bd-h{display:flex;justify-content:space-between;align-items:center;cursor:pointer;font-size:11px;font-weight:600}
+        .bd-b{display:none;margin-top:10px;font-size:11px}.bd-b.open{display:block}
+        .flags{display:flex;gap:3px;flex-wrap:wrap;margin:8px 0}
+        .sub{margin:8px 0;padding:8px 0;border-top:1px dashed var(--w5)}.sub:first-child{border-top:none}
+        .sub-t{font-weight:700;font-size:9px;color:var(--lg);text-transform:uppercase;letter-spacing:.8px;margin-bottom:5px}
+        .pre{background:var(--black);border:1px solid var(--b1);border-radius:var(--rs);padding:10px;font-size:10px;color:var(--lg);max-height:100px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;margin-top:5px;font-family:'JetBrains Mono',monospace;line-height:1.5}
+
+        /* ═══ COMPLIANCE ═══ */
+        .cr{display:flex;align-items:center;gap:8px;padding:3px 0;font-size:11px}
+        .cr .i{width:16px;text-align:center;flex-shrink:0;font-size:11px}
+        .cr.ok .i{color:var(--gn)}.cr.no .i{color:var(--rd)}.cr.half .i{color:var(--yl)}
+        .cr .l{flex:1;color:rgba(255,255,255,.7)}.cr .p{font-size:10px;color:var(--mg);width:36px;text-align:right;font-family:'JetBrains Mono',monospace}
+        .cg{display:grid;grid-template-columns:repeat(auto-fill,minmax(105px,1fr));gap:6px;margin:12px 0}
+        .cs{text-align:center;padding:10px 4px;background:var(--s2);border-radius:var(--r);border:1px solid var(--b1)}
+        .cs .v{font-size:16px;font-weight:800;letter-spacing:-.5px}.cs .lb{font-size:8px;color:var(--mg);margin-top:3px;text-transform:uppercase;letter-spacing:.5px}
+
+        /* ═══ S1 PANEL ═══ */
+        .s1-sec{margin:0;padding:0;border-top:1px solid var(--w8)}
+        .s1-sec:first-child{border-top:none}
+        .s1-hdr{display:flex;align-items:center;gap:10px;padding:12px 0;cursor:pointer;user-select:none}
+        .s1-hdr:hover{opacity:.85}
+        .s1-num{width:24px;height:24px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:800;flex-shrink:0;background:var(--og);color:var(--orange)}
+        .s1-ttl{flex:1;font-size:11px;font-weight:700;color:var(--white);letter-spacing:-.1px}
+        .s1-ttl small{font-weight:400;color:var(--mg);margin-left:6px}
+        .s1-arr{color:var(--mg);font-size:9px;transition:transform .2s}
+        .s1-sec.open .s1-arr{transform:rotate(180deg)}
+        .s1-body{display:none;padding:0 0 14px 34px;font-size:11px;color:rgba(255,255,255,.7)}
+        .s1-sec.open .s1-body{display:block}
+        .s1-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:6px;margin:8px 0}
+        .s1-stat{text-align:center;padding:10px 6px;background:var(--s2);border-radius:var(--rs);border:1px solid var(--b1)}
+        .s1-stat .v{font-size:18px;font-weight:800;color:var(--orange);letter-spacing:-.5px}
+        .s1-stat .l{font-size:8px;color:var(--mg);margin-top:2px;text-transform:uppercase;letter-spacing:.5px}
+        .s1-row{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:11px;color:var(--lg)}
+        .s1-row .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+        .s1-row .dot.on{background:var(--gn)}.s1-row .dot.off{background:var(--b3)}.s1-row .dot.warn{background:var(--yl)}
+        .s1-bar-row{display:flex;align-items:flex-end;gap:3px;height:50px;margin:8px 0}
+        .s1-bar-col{text-align:center;flex:1}
+        .s1-bar-col .bar{background:var(--orange);border-radius:3px 3px 0 0;opacity:.7;min-height:4px}
+        .s1-bar-col .lbl{font-size:8px;color:var(--mg);margin-top:2px}
+        .s1-cause{display:flex;align-items:center;gap:6px;padding:4px 0;font-size:11px}
+        .s1-cause .from{color:var(--lg)}.s1-cause .arrow{color:var(--orange);font-weight:700}.s1-cause .to{color:var(--lg)}
+        .s1-ent{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;margin:2px;border-radius:99px;font-size:10px;font-weight:500}
+        .s1-ent.must{background:var(--rdd);color:var(--rd);border:1px solid rgba(248,113,113,.15)}
+        .s1-ent.top{background:var(--og);color:var(--orange)}
+        .s1-ent.rel{background:rgba(251,169,44,.1);color:#fba92c}
+        .s1-ymyl{display:inline-flex;align-items:center;gap:6px;padding:6px 14px;margin:3px;border-radius:var(--rs);font-size:11px;font-weight:500;background:var(--s2);border:1px solid var(--b1)}
+        .s1-ymyl.active{border-color:var(--rd);background:var(--rdd);color:var(--rd)}
+        .s1-instr{background:var(--black);border:1px solid var(--b1);border-radius:var(--rs);padding:12px;font-size:10px;color:var(--lg);white-space:pre-wrap;word-break:break-word;margin:6px 0;font-family:'JetBrains Mono',monospace;line-height:1.5;max-height:180px;overflow-y:auto}
+
+        /* ═══ ARTICLE ═══ */
+        .art{background:var(--s1);border:1px solid var(--b1);border-radius:var(--rl);padding:24px;margin:14px 0;max-height:480px;overflow-y:auto;line-height:1.8;font-size:14px}
+        .art h2{color:var(--orange);font-size:17px;margin:22px 0 8px;font-weight:700;letter-spacing:-.3px}.art h2:first-child{margin-top:0}
+        .art h3{color:var(--white);font-size:14px;margin:16px 0 6px;font-weight:600}
+        .art p{color:rgba(255,255,255,.65);margin-bottom:12px}
+
+        .exp{display:flex;gap:8px;margin-top:14px}
+        .btn-e{flex:1;padding:11px;border-radius:var(--rs);border:1px solid var(--b1);background:var(--s1);color:var(--white);font-size:12px;font-weight:600;cursor:pointer;text-align:center;text-decoration:none;transition:all .15s;font-family:inherit}
+        .btn-e:hover{border-color:var(--orange);color:var(--orange)}
+        .btn-e.pri{background:var(--orange);border-color:var(--orange);color:var(--black)}
+        .btn-e.pri:hover{filter:brightness(1.1)}
+
+        .done{background:linear-gradient(135deg,var(--og2),var(--og));border:1px solid rgba(251,169,44,.15);border-radius:var(--rl);padding:22px;text-align:center;margin:14px 0}
+        .done h2{color:var(--orange);font-size:17px;font-weight:800;margin-bottom:3px;letter-spacing:-.3px}
+        .done p{color:rgba(255,255,255,.6);font-size:12px}
+
+        .logbox{background:var(--black);border:1px solid var(--b1);border-radius:var(--r);padding:12px 14px;max-height:220px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:10px;line-height:1.7}
+        .log-line{color:var(--lg)}.log-line .ts{color:var(--mg)}
+
+        /* ═══ ARTICLE EDITOR ═══ */
+        .editor-wrap{margin:14px 0;display:none}
+        .editor-wrap.visible{display:block}
+        .edit-bar{display:flex;gap:8px;margin-bottom:10px;align-items:center}
+        .btn-val{
+            padding:8px 16px;border-radius:var(--rs);border:1px solid var(--b1);
+            background:var(--s2);color:var(--lg);font-size:11px;font-weight:600;
+            cursor:pointer;font-family:inherit;transition:all .15s;white-space:nowrap
+        }
+        .btn-val:hover{border-color:var(--orange);color:var(--orange)}
+        .btn-val.loading{opacity:.5;cursor:wait}
+        .chat-box{background:var(--s1);border:1px solid var(--b1);border-radius:var(--rl);overflow:hidden}
+        .chat-hist{max-height:280px;overflow-y:auto;padding:14px 18px}
+        .chat-msg{margin:8px 0;padding:10px 14px;border-radius:var(--r);font-size:12px;line-height:1.6;max-width:85%}
+        .chat-msg.user{background:var(--og);color:var(--orange);margin-left:auto;text-align:right;border:1px solid rgba(251,169,44,.15)}
+        .chat-msg.ai{background:var(--s2);color:rgba(255,255,255,.8);border:1px solid var(--b1)}
+        .chat-msg .meta{font-size:9px;color:var(--mg);margin-top:4px}
+        .chat-input{display:flex;gap:8px;padding:12px 14px;border-top:1px solid var(--b1);background:var(--s2)}
+        .chat-input input{
+            flex:1;padding:10px 14px;background:var(--black);border:1px solid var(--b1);
+            border-radius:var(--rs);color:var(--white);font-size:13px;font-family:inherit;outline:none
+        }
+        .chat-input input:focus{border-color:rgba(251,169,44,.4)}
+        .chat-input input::placeholder{color:var(--mg)}
+        .chat-send{
+            padding:10px 20px;background:var(--orange);color:var(--black);border:none;
+            border-radius:var(--rs);font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;
+            transition:all .15s;white-space:nowrap
+        }
+        .chat-send:hover{filter:brightness(1.1)}
+        .chat-send:disabled{opacity:.4;cursor:wait}
+        .inline-tb{
+            position:fixed;display:none;z-index:200;
+            background:var(--black);border:1px solid var(--orange);border-radius:var(--r);
+            padding:8px 10px;box-shadow:0 8px 32px rgba(0,0,0,.6);
+            min-width:300px;max-width:420px
+        }
+        .inline-tb.vis{display:flex;gap:6px;align-items:center}
+        .inline-tb input{
+            flex:1;padding:8px 10px;background:var(--s2);border:1px solid var(--b1);
+            border-radius:6px;color:var(--white);font-size:12px;font-family:inherit;outline:none
+        }
+        .inline-tb input::placeholder{color:var(--mg)}
+        .inline-tb button{
+            padding:8px 14px;background:var(--orange);color:var(--black);border:none;
+            border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;font-family:inherit
+        }
+        .inline-tb .bx{background:none;color:var(--mg);padding:6px;font-size:14px}
+        .val-result{background:var(--s1);border:1px solid var(--b1);border-radius:var(--r);padding:14px;margin:10px 0;font-size:11px;display:none}
+        .val-result.vis{display:block}
+    </style>
+</head>
+<body>
+<div class="hd">
+    <div class="hd-l"><h1>BRAJEN <b>SEO</b></h1><span class="hd-badge">V45.3</span></div>
+    <div class="hd-r"><span>{{ username }}</span><a href="/logout">Wyloguj</a></div>
+</div>
+<div class="layout">
+    <div class="sidebar">
+        <div class="lbl">Keyword</div>
+        <input type="text" id="mainKeyword" placeholder="np. od czego zacząć przeprowadzkę">
+        <div class="lbl">Tryb</div>
+        <div class="modes">
+            <div class="mbtn on" data-mode="standard" onclick="selMode('standard')"><strong>Standard</strong><small>6–9 batchy</small></div>
+            <div class="mbtn" data-mode="fast" onclick="selMode('fast')"><strong>Fast</strong><small>3 batche</small></div>
+        </div>
+        <div class="lbl">Model AI</div>
+        <div class="modes" id="engineModes">
+            <div class="ebtn" data-engine="claude" onclick="selEngine('claude')"><strong>Claude</strong><small id="claudeModel">Opus 4.6</small></div>
+            <div class="ebtn on" data-engine="openai" onclick="selEngine('openai')"><strong>GPT</strong><small id="gptModel">GPT-4.1</small></div>
+        </div>
+        <div id="modelPicker" style="display:none;margin-top:4px">
+            <select id="openaiModelSel" style="width:100%;padding:6px 8px;background:var(--s2);border:1px solid var(--b1);border-radius:var(--rs);color:var(--fg);font-size:12px;font-family:inherit" onchange="selOpenaiModel(this.value)">
+                <option value="gpt-4.1" selected>GPT-4.1 — najlepszy instruction following + pisanie</option>
+                <option value="gpt-5.1">GPT-5.1 — top creative writing (EQ-Bench #1)</option>
+                <option value="gpt-5.2">GPT-5.2 — flagship, najnowszy (reasoning)</option>
+                <option value="gpt-4.1-mini">GPT-4.1 Mini — szybszy, tańszy</option>
+            </select>
+            <div class="hint" style="margin-top:2px">Zmienia model na jedną sesję. Env var OPENAI_MODEL = domyślny.</div>
+        </div>
+        <div class="lbl">Temperatura <span id="tempVal" style="opacity:.6;font-weight:400">0.7</span></div>
+        <input type="range" id="tempSlider" min="0" max="10" value="7" style="width:100%;accent-color:var(--orange)" oninput="setTemp(this.value)">
+        <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--mg);margin-top:-2px;margin-bottom:8px"><span>0.0 formalny</span><span>1.0 swobodny</span></div>
+        <div class="lbl">Nagłówki H2 <span style="opacity:.4;font-weight:400">opcjonalne</span></div>
+        <textarea id="h2Structure" rows="4" placeholder="Puste = auto z S1&#10;Lub wpisz wskazówki"></textarea>
+        <div class="hint">Puste → system sam wygeneruje z analizy konkurencji.</div>
+        <div class="lbl">Frazy BASIC <button class="tbtn" onclick="tog('bsc')">pokaż</button></div>
+        <div id="bsc" style="display:none"><textarea id="basicTerms" rows="3" placeholder="fraza: min-maxx"></textarea></div>
+        <div class="lbl">Frazy EXTENDED <button class="tbtn" onclick="tog('ext')">pokaż</button></div>
+        <div id="ext" style="display:none"><textarea id="extendedTerms" rows="3" placeholder="fraza: min-maxx"></textarea></div>
+        <div class="lbl">Instrukcje dla modelu <button class="tbtn" onclick="tog('ciBox')">pokaż</button></div>
+        <div id="ciBox" style="display:none"><textarea id="customInstr" rows="4" placeholder="np. Pisz potocznym tonem&#10;Dodaj przykłady z życia&#10;Używaj list numerowanych&#10;Grupa docelowa: studenci"></textarea><div class="hint">Dodatkowe wytyczne przekazywane do Claude przy każdym batchu i edycji.</div></div>
+        <button class="btn-go" id="btnStart" onclick="startWorkflow()">Uruchom workflow →</button>
+        <button class="btn-stop" id="btnStop" onclick="stopWF()">Zatrzymaj</button>
+    </div>
+    <div class="main">
+        <div id="wel" class="welcome"><div class="w-icon">⚡</div><h2>BRAJEN SEO Engine</h2><p>Wpisz keyword i uruchom workflow</p></div>
+        <div id="prog" style="display:none">
+            <div class="steps" id="stC"></div>
+            <div class="crd" id="h2C" style="display:none"><div class="crd-t"><b>Plan</b> H2</div><div id="h2L"></div></div>
+            <div class="pnl" id="s1P" style="display:none"><div class="pnl-h" onclick="tPnl('s1P')"><span>📊 Analiza S1 — Pełna mapa tematu</span><span class="arr">▼</span></div><div class="pnl-b" id="s1B" style="max-height:900px"></div></div>
+            <div class="pnl" id="biP" style="display:none"><div class="pnl-h" onclick="tPnl('biP')"><span>🎯 Pre-batch info</span><span class="arr">▼</span></div><div class="pnl-b" id="biB"></div></div>
+            <div class="crd" id="bpC" style="display:none"><div class="pg-top"><span class="pg-lbl">Generowanie</span><span class="pg-ct" id="bCt">0/0</span></div><div class="pg-bar"><div class="pg-fill" id="bFill" style="width:0%"></div></div><div class="chips" id="bRes"></div></div>
+            <div class="crd" id="frC" style="display:none"><div class="crd-t"><b>Final</b> Review</div><div class="sg sg4"><div class="sc"><div class="sv" id="frS">—</div><div class="sl">Score</div></div><div class="sc"><div class="sv" id="frSt">—</div><div class="sl">Status</div></div><div class="sc"><div class="sv" id="frM">—</div><div class="sl">Brakujące</div></div><div class="sc"><div class="sv" id="frI">—</div><div class="sl">Issues</div></div></div><div id="frQB" style="display:none;margin-top:10px;padding:8px 0;border-top:1px solid var(--bd)"><div style="font-size:11px;font-weight:600;margin-bottom:6px;color:var(--fg)">Quality Breakdown</div><div id="frBars" style="display:grid;grid-template-columns:90px 1fr 32px;gap:3px 8px;font-size:11px;align-items:center"></div></div><div id="frD" style="font-size:11px;color:var(--mg);margin-top:10px;max-height:60px;overflow-y:auto"></div></div>
+            <div class="crd" id="edC" style="display:none"><div class="crd-t" style="cursor:pointer" onclick="document.getElementById('edDet').style.display=document.getElementById('edDet').style.display==='none'?'block':'none'"><b>Editorial</b> Review <span style="float:right;font-size:10px;color:var(--mg)">▼ szczegóły</span></div><div class="sv xl" style="text-align:center" id="edSc">—<span>/10</span></div><div class="sg sg3"><div class="sc"><div class="sv" id="edCh">—</div><div class="sl">Zmiany</div></div><div class="sc"><div class="sv" id="edW">—</div><div class="sl">Słowa</div></div><div class="sc"><div class="sv" id="edR">—</div><div class="sl">Rollback</div></div></div><div id="edDet" style="display:none;padding:8px 12px;font-size:11px;border-top:1px solid var(--bd);max-height:300px;overflow-y:auto"></div></div>
+            <div class="pnl" id="cpP" style="display:none"><div class="pnl-h" onclick="tPnl('cpP')"><span>✅ S1 Compliance</span><span class="arr">▼</span></div><div class="pnl-b" id="cpB"></div></div>
+            <div class="crd" id="esC" style="display:none"><div class="crd-t"><b>🔬 Entity</b> Salience (Google NLP)</div><div class="sg sg3"><div class="sc"><div class="sv" id="esSc">—</div><div class="sl">Score</div></div><div class="sc"><div class="sv" id="esSal">—</div><div class="sl">Main Salience</div></div><div class="sc"><div class="sv" id="esDom">—</div><div class="sl">Dominacja</div></div></div><div id="esSP" style="display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--bd)"><div style="font-size:11px;font-weight:600;margin-bottom:4px">📐 Subject Position</div><div class="sg sg4" style="font-size:10px"><div class="sc"><div class="sv" id="spSc">—</div><div class="sl">Score</div></div><div class="sc"><div class="sv" id="spSR">—</div><div class="sl">Podmiot %</div></div><div class="sc"><div class="sv" id="spH2">—</div><div class="sl">H2</div></div><div class="sc"><div class="sv" id="sp1st">—</div><div class="sl">1. zdanie</div></div></div></div><div id="esEnts" style="margin-top:10px;font-size:11px;display:none"></div><div id="esIss" style="margin-top:8px;font-size:11px;color:var(--mg)"></div></div>
+            <div class="crd" id="afC" style="display:none"><div class="crd-t"><b>🎭 Anti-Frankenstein</b> Style Analysis</div><div class="sg sg4"><div class="sc"><div class="sv" id="afSc">—</div><div class="sl">Score</div></div><div class="sc"><div class="sv" id="afCV">—</div><div class="sl">CV Zdań</div></div><div class="sc"><div class="sv" id="afP">—</div><div class="sl">Passive</div></div><div class="sc"><div class="sv" id="afSL">—</div><div class="sl">Śr. zdanie</div></div></div><div id="afIss" style="margin-top:8px;font-size:11px;color:var(--mg)"></div></div>
+            <div class="crd" id="ymC" style="display:none"><div class="crd-t"><b>⚖️🏥 YMYL</b> Analiza wiarygodności</div><div class="sg sg4"><div class="sc"><div class="sv" id="ymLS">—</div><div class="sl">Prawo</div></div><div class="sc"><div class="sv" id="ymMS">—</div><div class="sl">Medycyna</div></div><div class="sc"><div class="sv" id="ymR">—</div><div class="sl">Źródła</div></div><div class="sc"><div class="sv" id="ymD">—</div><div class="sl">Zastrzeżenie</div></div></div><div id="ymDetail" style="margin-top:8px;font-size:12px;color:var(--mg)"></div></div>
+            <div class="pnl" id="schP" style="display:none"><div class="pnl-h" onclick="tPnl('schP')"><span>📋 Schema.org JSON-LD</span><span class="arr">▼</span></div><div class="pnl-b" id="schB"><pre id="schCode" style="font-size:10px;background:var(--bg2);padding:10px;border-radius:6px;overflow-x:auto;max-height:300px;white-space:pre-wrap"></pre><button class="tbtn" style="margin-top:6px" onclick="navigator.clipboard.writeText(document.getElementById('schCode').textContent).then(()=>this.textContent='✓ Skopiowano!').catch(()=>this.textContent='Błąd')">📋 Kopiuj JSON-LD</button></div></div>
+            <div class="pnl" id="tmP" style="display:none"><div class="pnl-h" onclick="tPnl('tmP')"><span>🗺️ Topical Map (rekomendacje klastrów)</span><span class="arr">▼</span></div><div class="pnl-b" id="tmB"></div></div>
+            <div class="pnl" id="ciP" style="display:none"><div class="pnl-h" onclick="tPnl('ciP')"><span>📊 Competitive Intelligence Dashboard</span><span class="arr">▼</span></div><div class="pnl-b open" id="ciB"></div></div>
+            <div class="done" id="doneB" style="display:none"><h2>✓ Artykuł gotowy</h2><p id="doneD"></p></div>
+            <div class="exp" id="expB" style="display:none"><a class="btn-e pri" id="exH">HTML</a><a class="btn-e" id="exD">DOCX</a></div>
+            <div style="margin-top:20px"><span class="lbl">📄 Podgląd artykułu (buduje się na żywo) <button class="tbtn" onclick="tog('artP')">pokaż/ukryj</button></span></div>
+            <div class="art" id="artP" style="display:none"></div>
+
+            <!-- ARTICLE EDITOR -->
+            <div class="editor-wrap" id="editorWrap">
+                <div class="edit-bar">
+                    <span class="lbl" style="margin:0;flex:1;display:flex;align-items:center">✏️ Edytor artykułu</span>
+                    <button class="btn-val" id="btnValidate" onclick="validateArt()">🔍 Zwaliduj</button>
+                </div>
+                <div class="val-result" id="valResult"></div>
+                <div class="chat-box">
+                    <div class="chat-hist" id="chatHist">
+                        <div class="chat-msg ai">Artykuł gotowy! Napisz co chcesz zmienić, albo zaznacz fragment tekstu powyżej.<div class="meta">💡 zaznacz tekst w podglądzie → pojawi się mini-edytor</div></div>
+                    </div>
+                    <div class="chat-input">
+                        <input type="text" id="chatIn" placeholder="np. Zmień ton na bardziej potoczny…" onkeydown="if(event.key==='Enter')sendEdit()">
+                        <button class="chat-send" id="chatBtn" onclick="sendEdit()">Wyślij →</button>
+                    </div>
+                </div>
+            </div>
+            <div class="inline-tb" id="inlineTb">
+                <input type="text" id="inlineIn" placeholder="Co zmienić w zaznaczeniu?" onkeydown="if(event.key==='Enter')sendInline()">
+                <button onclick="sendInline()">OK</button>
+                <button class="bx" onclick="hideInl()">✕</button>
+            </div>
+            <div style="margin-top:16px"><span class="lbl">Logi <button class="tbtn" onclick="tog('logC')">pokaż</button></span></div>
+            <div class="logbox" id="logC"></div>
+        </div>
+    </div>
+</div>
+<script>
+(function(){const n=['S1 Analysis','YMYL','H2 Plan','Create Project','Phrase Hierarchy','Batch Loop','PAA / FAQ','Final Review','Editorial','Export'],c=document.getElementById('stC');n.forEach((x,i)=>{c.innerHTML+=`<div class="stp"><div class="stp-i pending" id="si${i+1}">${i+1}</div><div><div class="stp-n">${x}</div><div class="stp-d" id="sd${i+1}">—</div></div></div>`;})})();
+
+let mode='standard',engine='openai',openaiModel='gpt-4.1',temperature=0.7,jid=null,tb=0,es=null,rawArticle='',selTxt='',s1Data=null,batchLog=[],finalData=null,salienceData=null,styleData=null,memoryData=null,articleData=null,editorialData=null,stepTimingData=null,paaData=null,ymylCtxData=null,ymylAnalysisData=null,ymylValData=null,liveArticle='';
+const O='#fba92c',G='#34d399',R='#f87171',W='#fbbf24',M='#9e9e9e';
+
+// XSS sanitization for SSE data
+function esc(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+
+function selMode(m){mode=m;document.querySelectorAll('.mbtn').forEach(b=>b.classList.toggle('on',b.dataset.mode===m))}
+function selEngine(e){engine=e;document.querySelectorAll('.ebtn').forEach(b=>b.classList.toggle('on',b.dataset.engine===e));document.getElementById('modelPicker').style.display=e==='openai'?'':'none'}
+function setTemp(v){temperature=v/10;document.getElementById('tempVal').textContent=temperature.toFixed(1)}
+function selOpenaiModel(m){openaiModel=m;document.getElementById('gptModel').textContent=m.toUpperCase()}
+// Check available engines on load
+(async function(){try{const r=await fetch('/api/engines');if(r.ok){const d=await r.json();const eng=d.engines||{};
+if(eng.claude&&eng.claude.model)document.getElementById('claudeModel').textContent=eng.claude.model.replace('claude-','').replace(/-\d{8}/,'');
+if(eng.openai&&eng.openai.model)document.getElementById('gptModel').textContent=eng.openai.model;
+if(eng.openai&&!eng.openai.available){document.querySelector('.ebtn[data-engine=openai]').classList.add('unavailable');if(engine==='openai'){selEngine('claude')}}
+if(eng.claude&&!eng.claude.available){document.querySelector('.ebtn[data-engine=claude]').classList.add('unavailable');if(engine==='claude'){selEngine('openai')}}
+}}catch(e){}})()
+function tog(id){const e=document.getElementById(id);e.style.display=e.style.display==='none'?'':'none'}
+function log(m){const c=document.getElementById('logC');c.innerHTML+=`<div class="log-line"><span class="ts">${new Date().toLocaleTimeString('pl-PL')}</span> ${esc(m)}</div>`;c.scrollTop=c.scrollHeight}
+function uStep(s,st,d){const i=document.getElementById(`si${s}`),dt=document.getElementById(`sd${s}`);if(!i)return;i.className=`stp-i ${st}`;if(st==='done')i.textContent='✓';else if(st==='running')i.textContent='⟳';else if(st==='warning')i.textContent='!';else if(st==='error')i.textContent='✗';if(d&&dt)dt.textContent=d}
+function tPnl(id){const p=document.getElementById(id),b=p.querySelector('.pnl-b'),h=p.querySelector('.pnl-h');b.classList.toggle('open');h.classList.toggle('open')}
+function tBd(id){document.getElementById(id).classList.toggle('open')}
+
+function kc(l,c){if(!l||!l.length)return'<span style="color:var(--mg)">—</span>';return l.map(k=>`<span class="chip ${c}">${esc(typeof k==='object'?(k.keyword||JSON.stringify(k)):k)}</span>`).join('')}
+function fl(l,a,c){return`<span class="tag ${a?c:'d'}">${a?'✅':'—'} ${esc(l)}</span>`}
+function ss(v){if(v==null)return'';if(typeof v==='string')return esc(v);return typeof v==='object'?esc(JSON.stringify(v)):esc(String(v))}
+function el(i){if(typeof i==='string')return esc(i);return esc(i.text||i.entity||i.name||i.phrase||i.ngram||i.question||i.pattern||i.h2||i.title||i.topic||i.gap||i.keyword||(typeof i==='object'?Object.values(i).find(v=>typeof v==='string'&&v.length>1&&v.length<100)||JSON.stringify(i):String(i)))}
+function fc(f){const p=f.split('/');if(p.length!==2)return M;const[n,d]=p.map(Number);if(!d)return M;const r=(n/d)*100;return r>=70?G:r>=40?W:R}
+
+// ═══ S1 PANEL (10 Sections) ═══
+function tS1(id){const s=document.getElementById(id);s.classList.toggle('open')}
+function s1Sec(n,title,badge,body){return`<div class="s1-sec" id="s1s${n}"><div class="s1-hdr" onclick="tS1('s1s${n}')"><div class="s1-num">${n}</div><div class="s1-ttl">${title}${badge?` <small>${badge}</small>`:''}</div><span class="s1-arr">▼</span></div><div class="s1-body">${body}</div></div>`}
+
+function rS1(d){
+    document.getElementById('s1P').style.display='';
+    let h='';
+
+    // ─── 1️⃣ SERP & Competitor Structure ───
+    let b1='';
+    b1+=`<div class="s1-grid">`;
+    b1+=`<div class="s1-stat"><div class="v">${d.recommended_length||'?'}</div><div class="l">Rekomendacja</div></div>`;
+    b1+=`<div class="s1-stat"><div class="v">${d.median_length||'?'}</div><div class="l">Mediana</div></div>`;
+    b1+=`<div class="s1-stat"><div class="v">${d.average_length||'?'}</div><div class="l">Średnia</div></div>`;
+    b1+=`<div class="s1-stat"><div class="v">${d.analyzed_urls||'?'}</div><div class="l">Stron</div></div>`;
+    b1+=`<div class="s1-stat"><div class="v">${d.h2_patterns_count||0}</div><div class="l">Wzorców H2</div></div>`;
+    b1+=`</div>`;
+    if(d.search_intent)b1+=`<div style="margin:8px 0"><span class="tag o" style="font-size:11px">🎯 ${esc(d.search_intent)}</span></div>`;
+    const wc=d.word_counts||[];
+    if(wc.length){const mx=Math.max(...wc.slice(0,10));b1+=`<div style="margin:10px 0"><div style="font-size:9px;color:var(--mg);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">Rozkład długości top ${wc.length}</div><div class="s1-bar-row">${wc.slice(0,10).map(w=>{const ht=mx>0?Math.round((w/mx)*44)+4:10;return`<div class="s1-bar-col"><div class="bar" style="height:${ht}px"></div><div class="lbl">${w}</div></div>`}).join('')}</div></div>`}
+    const h2p=d.competitor_h2_patterns||[];
+    if(h2p.length)b1+=`<div style="margin:10px 0"><div style="font-size:9px;color:var(--mg);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">Dominujące wzorce H2</div>${h2p.slice(0,12).map((x,i)=>`<div style="color:var(--lg);font-size:11px;padding:2px 0"><span style="color:var(--orange);font-weight:700;width:18px;display:inline-block">${i+1}.</span>${el(x)}</div>`).join('')}</div>`;
+    const ss2=d.serp_sources||[];
+    // v47: Competitor table with titles, word counts, H2 counts
+    const sc=d.serp_competitors||[];
+    if(sc.length){b1+=`<div style="margin:10px 0"><div style="font-size:9px;color:var(--mg);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">Konkurencja SERP (${sc.length} stron)</div><div style="display:grid;grid-template-columns:1fr 60px 40px;gap:2px 8px;font-size:10px">`;b1+=`<div style="font-weight:600;color:var(--mg)">URL / Tytuł</div><div style="font-weight:600;color:var(--mg)">Słów</div><div style="font-weight:600;color:var(--mg)">H2</div>`;sc.slice(0,8).forEach(c=>{const url=c.url||'';const title=c.title||'';const wc2=c.word_count||0;const h2c=c.h2_count||0;b1+=`<div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(url)}">${esc(title||url.replace(/https?:\/\/(www\.)?/,'').substring(0,50))}</div><div style="color:${wc2>2000?G:wc2>1000?W:R}">${wc2||'?'}</div><div>${h2c}</div>`});b1+=`</div></div>`}
+    else if(ss2.length)b1+=`<div style="margin:10px 0"><div style="font-size:9px;color:var(--mg);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">Źródła SERP</div>${ss2.slice(0,8).map(s=>`<div style="font-size:10px;color:var(--mg);padding:2px 0">${esc(typeof s==='string'?s:(s.url||s.title||s.domain||JSON.stringify(s)).substring(0,80))}</div>`).join('')}</div>`;
+    // v47: Competitor snippets (what Google shows in SERP)
+    const cSnippets=d.competitor_snippets||[];
+    if(cSnippets.length>0){b1+=`<div style="margin:10px 0"><div style="font-size:9px;color:var(--mg);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">SERP Snippets (co Google pokazuje)</div>`;cSnippets.slice(0,5).forEach((sn,i)=>{b1+=`<div style="font-size:10px;color:var(--lg);padding:3px 0;border-bottom:1px solid var(--bd)"><span style="color:var(--orange);font-weight:700">${i+1}.</span> ${esc(typeof sn==='string'?sn.substring(0,120):(sn.snippet||'').substring(0,120))}</div>`});b1+=`</div>`}
+    const fs=d.featured_snippet,aio=d.ai_overview,rs=d.related_searches||[];
+    if(fs)b1+=`<div style="margin:6px 0"><span class="tag g" style="white-space:normal;line-height:1.4">📋 Featured Snippet: ${esc((typeof fs==='string'?fs:(fs.text||JSON.stringify(fs))).substring(0,150))}</span></div>`;
+    if(aio)b1+=`<div style="margin:6px 0"><span class="tag o" style="white-space:normal;line-height:1.4">🤖 AI Overview: ${esc((typeof aio==='string'?aio:(aio.text||JSON.stringify(aio))).substring(0,150))}</span></div>`;
+    if(rs.length)b1+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--mg);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">Related Searches</div>${rs.map(r=>`<span class="tag d">${ss(r)}</span>`).join('')}</div>`;
+    h+=s1Sec(1,'Analiza SERP i struktury konkurencji',`${d.analyzed_urls||'?'} stron`,b1);
+
+    // ─── 2️⃣ Causal Triplets ───
+    let b2='';
+    const cc=d.causal_chains||[],csi=d.causal_singles||[];
+    const totalC=(d.causal_count_chains||0)+(d.causal_count_singles||0);
+    if(cc.length){b2+=`<div style="font-size:9px;color:var(--mg);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px">Łańcuchy (A → B → C)</div>`;cc.slice(0,8).forEach(t=>{b2+=`<div class="s1-cause"><span class="from">${esc(t.cause||t.from||'?')}</span><span class="arrow">→</span><span class="to">${esc(t.effect||t.to||'?')}</span></div>`})}
+    if(csi.length){b2+=`<div style="font-size:9px;color:var(--mg);margin:8px 0 6px;text-transform:uppercase;letter-spacing:.5px">Relacje kauzalne</div>`;csi.slice(0,8).forEach(t=>{b2+=`<div class="s1-cause"><span class="from">${esc(t.cause||t.from||'?')}</span><span class="arrow">→</span><span class="to">${esc(t.effect||t.to||'?')}</span></div>`})}
+    if(d.causal_instruction)b2+=`<div style="margin-top:8px"><div style="font-size:9px;color:var(--mg);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">Instrukcja</div><div class="s1-instr">${esc(d.causal_instruction)}</div></div>`;
+    if(!totalC)b2+=`<div style="color:var(--mg);font-style:italic">Brak danych kauzalnych z konkurencji</div>`;
+    h+=s1Sec(2,'Causal Triplets — mapa przyczynowo-skutkowa',`${totalC} relacji`,b2);
+
+    // ─── 3️⃣ Gap Analysis ───
+    let b3='';
+    const pU=d.paa_unanswered||[],sM=d.subtopic_missing||[],dM=d.depth_missing||[],sh2=d.suggested_h2s||[];
+    const totalGaps=pU.length+sM.length+dM.length;
+    if(pU.length){b3+=`<div style="margin:6px 0"><div style="font-size:9px;margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px"><span style="color:var(--rd)">🔴</span> PAA Unanswered (${pU.length})</div>${pU.map(g=>`<span class="tag r">${el(g)}</span>`).join('')}</div>`}
+    if(sM.length){b3+=`<div style="margin:6px 0"><div style="font-size:9px;margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px"><span style="color:var(--orange)">🟠</span> Subtopic Missing (${sM.length})</div>${sM.map(g=>`<span class="tag o">${el(g)}</span>`).join('')}</div>`}
+    if(dM.length){b3+=`<div style="margin:6px 0"><div style="font-size:9px;margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px"><span style="color:var(--yl)">🟡</span> Depth Missing (${dM.length})</div>${dM.map(g=>`<span class="tag w">${el(g)}</span>`).join('')}</div>`}
+    if(sh2.length){b3+=`<div style="margin:8px 0"><div style="font-size:9px;color:var(--gn);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">✨ Sugerowane nowe H2</div>${sh2.map(x=>`<span class="tag g">${ss(x)}</span>`).join('')}</div>`}
+    if(d.gaps_instruction)b3+=`<div style="margin-top:8px"><div style="font-size:9px;color:var(--mg);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">Instrukcja priorytetów</div><div class="s1-instr">${esc(d.gaps_instruction)}</div></div>`;
+    if(!totalGaps&&!sh2.length)b3+=`<div style="color:var(--mg);font-style:italic">Brak wykrytych luk — sprawdź logi S1 (możliwa kontaminacja scrapera)</div>`;
+    h+=s1Sec(3,'Gap Analysis — przewagi konkurencyjne',`${totalGaps} luk`,b3);
+
+    // ─── 4️⃣ Entity SEO ───
+    let b4='';
+    const ent=d.entity_seo||{},tE=ent.top_entities||[],mE=ent.must_mention||[],eR=ent.relations||[],tC=ent.topical_coverage||[],cE=ent.concept_entities||[];
+    // v45.4.1: Show concept entities (from topical_entity_extractor) FIRST — most valuable
+    if(cE.length){b4+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--gn);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px;font-weight:700">🧠 CONCEPT ENTITIES (${cE.length})</div>${cE.slice(0,15).map(e=>{const name=el(e),imp=typeof e==='object'?(e.importance||''):'',fm=typeof e==='object'&&e.freq_median?` ${e.freq_min}-${e.freq_max}×`:'';return`<span class="s1-ent top" style="border-color:var(--gn)">${name}${fm?`<span style="font-size:9px;opacity:.7;color:var(--gn)">${fm}</span>`:''}${imp?` <span style="font-size:8px;opacity:.5">${typeof imp==='number'?imp.toFixed(2):imp}</span>`:''}</span>`}).join('')}</div>`}
+    // v47.0: Topical summary — render as object with must_cover/should_cover
+    const tSum=ent.topical_summary||{};
+    if(typeof tSum==='object'&&tSum!==null){const mc=tSum.must_cover||[],sc=tSum.should_cover||[],ai=tSum.agent_instruction||'';if(mc.length||sc.length||ai){b4+=`<div style="margin:6px 0;border-left:2px solid var(--gn);padding-left:8px">`;if(ai)b4+=`<div class="s1-instr" style="margin-bottom:4px">${esc(ai)}</div>`;if(mc.length)b4+=`<div style="margin:4px 0"><span style="font-size:8px;color:var(--rd);font-weight:700;text-transform:uppercase">MUST COVER (${tSum.must_cover_count||mc.length}):</span> ${mc.slice(0,8).map(c=>{const t=typeof c==='object'?(c.text||c.entity||''):c;return`<span class="tag r">${esc(t)}</span>`}).join('')}</div>`;if(sc.length)b4+=`<div style="margin:4px 0"><span style="font-size:8px;color:var(--yl);font-weight:700;text-transform:uppercase">SHOULD COVER:</span> ${sc.slice(0,6).map(c=>{const t=typeof c==='object'?(c.text||c.entity||''):c;return`<span class="tag o">${esc(t)}</span>`}).join('')}</div>`;b4+=`</div>`}}else if(typeof tSum==='string'&&tSum){b4+=`<div class="s1-instr" style="margin:6px 0;border-left:2px solid var(--gn)">${esc(tSum)}</div>`}
+    // v47.0: Top-level must_cover_concepts and concept_instruction
+    const mcc=d.must_cover_concepts||[],ci=d.concept_instruction||'';
+    if(!tSum.must_cover&&mcc.length){b4+=`<div style="margin:6px 0"><span style="font-size:8px;color:var(--gn);font-weight:700;text-transform:uppercase">💡 MUST COVER CONCEPTS:</span> ${mcc.slice(0,8).map(c=>{const t=typeof c==='object'?(c.text||c.entity||''):c;return`<span class="tag g">${esc(t)}</span>`}).join('')}</div>`}
+    if(!tSum.agent_instruction&&ci){b4+=`<div class="s1-instr" style="margin:6px 0;border-left:2px solid var(--gn)">${esc(ci)}</div>`}
+    if(mE.length)b4+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--rd);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px;font-weight:700">MUST MENTION</div>${mE.map(e=>`<span class="s1-ent must">${el(e)}</span>`).join('')}</div>`;
+    if(tE.length)b4+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--mg);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">Named entities (${ent.entity_count||tE.length})</div>${tE.slice(0,15).map(e=>{const name=el(e),typ=typeof e==='object'?(e.type||''):'',fm=typeof e==='object'&&e.freq_median?` ${e.freq_min}-${e.freq_max}×`:'';return`<span class="s1-ent top">${name}${fm?`<span style="font-size:9px;opacity:.7;color:var(--gn)">${fm}</span>`:''}${typ?` <span style="font-size:8px;opacity:.5">${typ}</span>`:''}</span>`}).join('')}</div>`;
+    if(eR.length)b4+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--mg);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">Relacje SVO (${eR.length})</div>${eR.slice(0,8).map(r=>{if(typeof r==='string')return`<span class="s1-ent rel">${esc(r)}</span>`;const subj=r.from||r.subject||'?',obj=r.to||r.object||'?',verb=r.relation||r.verb||'→',rtype=r.type||'';return`<span class="s1-ent rel">${esc(subj)} <span style="opacity:.5">${esc(verb)}</span> ${esc(obj)}${rtype?` <span style="font-size:7px;opacity:.4">[${esc(rtype)}]</span>`:''}</span>`}).join('')}</div>`;
+    // v47.0: Entity Salience from backend competitor analysis
+    const bSal=ent.entity_salience||[];
+    if(bSal.length){b4+=`<div style="margin:8px 0"><div style="font-size:9px;color:var(--pr);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px;font-weight:700">🔬 SALIENCE (z analizy konkurencji)</div><div style="display:flex;flex-wrap:wrap;gap:4px;align-items:end">`;bSal.slice(0,10).forEach(s=>{const ht=Math.max(14,Math.round((s.salience||0)*80));const isPrimary=bSal.indexOf(s)===0;b4+=`<div style="display:flex;flex-direction:column;align-items:center;width:55px"><div style="width:100%;height:${ht}px;background:${isPrimary?'var(--pr)':'var(--gn)'};border-radius:3px 3px 0 0;opacity:${isPrimary?1:.6}" title="${s.entity}: ${s.salience}"></div><div style="font-size:7px;margin-top:2px;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;font-weight:${isPrimary?'800':'400'}">${esc(s.entity||'')}</div><div style="font-size:7px;opacity:.5">${(s.salience||0).toFixed(2)}</div></div>`});b4+=`</div></div>`}
+    // v47.0: Co-occurrence pairs
+    const bCooc=ent.entity_cooccurrence||[];
+    if(bCooc.length){b4+=`<div style="margin:8px 0"><div style="font-size:9px;color:var(--orange);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px;font-weight:700">🔗 CO-OCCURRENCE (${bCooc.length} par)</div>`;bCooc.slice(0,6).forEach(p=>{b4+=`<div style="padding:2px 0;font-size:10px"><span style="color:var(--pr)">${esc(p.entity_a||'')}</span> + <span style="color:var(--pr)">${esc(p.entity_b||'')}</span> <span style="opacity:.4;font-size:8px">str: ${(p.strength||0).toFixed(2)} | ${p.sentence_co_occurrences||0} zdań | ${p.sources_count||0} źródeł</span></div>`});b4+=`</div>`}
+    // v47.0: Placement instruction preview
+    const bPlace=ent.entity_placement||{};
+    if(bPlace.placement_instruction){b4+=`<div style="margin:8px 0"><div style="font-size:9px;color:var(--gn);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px;font-weight:700">📐 PLACEMENT INSTRUCTION</div><div class="s1-instr" style="max-height:200px;overflow-y:auto">${esc(bPlace.placement_instruction)}</div></div>`}
+    if(tC.length)b4+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--mg);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">Topical Coverage</div>${tC.slice(0,10).map(t=>{const topic=typeof t==='string'?t:(t.subtopic||t.topic||el(t)),pri=typeof t==='object'?(t.priority||''):'';return`<span class="tag ${pri==='MUST'?'r':pri==='HIGH'?'o':'d'}">${topic}${pri?` · ${pri}`:''}</span>`}).join('')}</div>`;
+    if(!tE.length&&!mE.length&&!cE.length)b4+=`<div style="color:var(--mg);font-style:italic">Brak danych encji — sprawdź czy trafilatura działa na produkcji</div>`;
+    h+=s1Sec(4,'Encje — mapa bytów tematu',`${cE.length?cE.length+' concept + ':''}${ent.entity_count||tE.length} named`,b4);
+
+    // ─── 5️⃣ N-grams & Collocations ───
+    let b5='';
+    const ng=d.ngrams||[],skp=d.semantic_keyphrases||[];
+    if(ng.length)b5+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--mg);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">N-gramy (${ng.length})</div>${ng.map(n=>{const l=el(n),w=typeof n==='object'?(n.weight||n.score||''):'',fm=typeof n==='object'&&n.freq_median?` ${n.freq_min}-${n.freq_max}×`:'';return`<span class="tag c">${l}${fm?`<span style="opacity:.6;color:var(--gn)">${fm}</span>`:''}${w?` <span style="opacity:.5">· ${typeof w==='number'?w.toFixed(2):w}</span>`:''}</span>`}).join('')}</div>`;
+    if(skp.length)b5+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--mg);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">Semantic Keyphrases (${skp.length})</div>${skp.map(k=>`<span class="tag pk">${el(k)}</span>`).join('')}</div>`;
+    if(!ng.length&&!skp.length)b5+=`<div style="color:var(--mg);font-style:italic">N-gramy odfiltrowane (CSS garbage) — concept entities powyżej są wiarygodniejsze</div>`;
+    h+=s1Sec(5,'N-gramy i kolokacje',`${ng.length+skp.length} fraz`,b5);
+
+    // ─── 6️⃣ Phrase Hierarchy ───
+    let b6='';
+    const ph=d.phrase_hierarchy_preview||{};
+    const phKeys=Object.keys(ph);
+    if(phKeys.length){phKeys.forEach(strategy=>{const data=ph[strategy];b6+=`<div style="margin:6px 0"><span class="tag ${strategy==='extensions_sufficient'?'g':strategy==='need_standalone'?'r':'o'}" style="font-size:11px;font-weight:600">${strategy}</span>`;if(data&&data.description)b6+=`<div style="color:var(--lg);font-size:10px;margin:4px 0">${data.description}</div>`;if(data&&data.roots&&data.roots.length)b6+=`<div style="margin-top:4px">${data.roots.map(r=>`<span class="tag d">${typeof r==='string'?r:(r.root||el(r))} ${typeof r==='object'&&r.extensions?`<span style="opacity:.5">(${r.extensions} ext)</span>`:''}</span>`).join('')}</div>`;b6+=`</div>`})}else{b6+=`<div style="color:var(--mg);font-style:italic">Dane hierarchii fraz pojawią się w KROK 5</div>`}
+    h+=s1Sec(6,'Phrase Hierarchy — strategia słów kluczowych',phKeys.length?phKeys.join(', '):'',b6);
+
+    // ─── 7️⃣ Depth Analysis ───
+    let b7='';
+    const ds=d.depth_signals||{},dmi=d.depth_missing_items||[];
+    const depthItems=[
+        ['🔢','Liczby / dane ilościowe',ds.numbers_used],['📅','Daty / ramy czasowe',ds.dates_used],
+        ['🏛️','Instytucje / organizacje',ds.institutions_cited],['📚','Badania / źródła',ds.research_cited],
+        ['⚖️','Przepisy prawne',ds.laws_referenced],['⚠️','Wyjątki / edge cases',ds.exceptions_noted],
+        ['⚖','Porównania',ds.comparisons_made],['📋','Procesy krok po kroku',ds.step_by_step]
+    ];
+    b7+=`<div style="font-size:9px;color:var(--mg);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px">Sygnały głębokości w konkurencji</div>`;
+    depthItems.forEach(([icon,label,val])=>{b7+=`<div class="s1-row"><div class="dot ${val?'on':'off'}"></div>${icon} ${label}</div>`});
+    if(dmi.length)b7+=`<div style="margin-top:8px"><div style="font-size:9px;color:var(--yl);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">Luki głębokości do wykorzystania</div>${dmi.map(g=>`<span class="tag w">${el(g)}</span>`).join('')}</div>`;
+    h+=s1Sec(7,'Analiza głębokości konkurencji',`${depthItems.filter(x=>x[2]).length}/8 sygnałów`,b7);
+
+    // ─── 8️⃣ YMYL Signals ───
+    let b8='';
+    const ym=d.ymyl_hints||{};
+    b8+=`<div style="display:flex;flex-wrap:wrap;gap:6px;margin:6px 0">`;
+    b8+=`<div class="s1-ymyl ${ym.legal_signals?'active':''}">⚖️ Prawo ${ym.legal_signals?'WYKRYTO':'—'}</div>`;
+    b8+=`<div class="s1-ymyl ${ym.medical_signals?'active':''}">🏥 Zdrowie ${ym.medical_signals?'WYKRYTO':'—'}</div>`;
+    b8+=`<div class="s1-ymyl ${ym.needs_citations?'active':''}">📚 Cytowania ${ym.needs_citations?'WYMAGANE':'—'}</div>`;
+    b8+=`<div class="s1-ymyl ${ym.needs_disclaimer?'active':''}">⚠️ Disclaimer ${ym.needs_disclaimer?'POTRZEBNY':'—'}</div>`;
+    b8+=`</div>`;
+    const anyYmyl=ym.legal_signals||ym.medical_signals||ym.needs_citations||ym.needs_disclaimer;
+    if(anyYmyl)b8+=`<div style="margin-top:6px;font-size:10px;color:var(--rd)">⚠️ Szczegółowa walidacja YMYL w KROK 2</div>`;
+    h+=s1Sec(8,'Wstępne sygnały YMYL',anyYmyl?'⚠️ WYKRYTO':'✓ BRAK',b8);
+
+    // ─── 9️⃣ PAA / FAQ Potential ───
+    let b9='';
+    const paa=d.paa_questions||[];
+    const paaUn=d.paa_unanswered_count||0;
+    if(paa.length){b9+=`<div class="s1-grid" style="grid-template-columns:repeat(2,1fr)"><div class="s1-stat"><div class="v">${paa.length}</div><div class="l">Pytań z SERP</div></div><div class="s1-stat"><div class="v" style="color:var(--rd)">${paaUn}</div><div class="l">Niedopowiedz.</div></div></div>`;b9+=`<div style="margin:8px 0">${paa.map((q,i)=>{const txt=el(q),isUnanswered=pU.some(u=>el(u)===txt);return`<div style="padding:3px 0;font-size:11px;color:var(--lg)"><span style="color:${isUnanswered?'var(--rd)':'var(--orange)'};font-weight:700">${isUnanswered?'✗':'•'}</span> ${txt}</div>`}).join('')}</div>`}else{b9+=`<div style="color:var(--mg);font-style:italic">Brak pytań PAA z SERP</div>`}
+    h+=s1Sec(9,'Potencjał FAQ / PAA',`${paa.length} pytań`,b9);
+
+    // ─── 🔟 Agent Instructions ───
+    let b10='';
+    const ai=d.agent_instructions||{},sh=d.semantic_hints||{};
+    if(ai.gaps)b10+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--orange);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px;font-weight:700">📋 Priorytety luk</div><div class="s1-instr">${esc(ai.gaps)}</div></div>`;
+    if(ai.causal)b10+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--orange);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px;font-weight:700">🔗 Instrukcje kauzalne</div><div class="s1-instr">${esc(ai.causal)}</div></div>`;
+    if(ai.semantic&&Object.keys(ai.semantic).length)b10+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--orange);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px;font-weight:700">🎯 Checkpoints semantyczne</div><div class="s1-instr">${esc(Object.entries(ai.semantic).map(([k,v])=>`${k}: ${v}`).join('\n'))}</div></div>`;
+    if(sh.critical_entities&&sh.critical_entities.length)b10+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--rd);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">🔴 Critical entities</div>${sh.critical_entities.map(e=>`<span class="s1-ent must">${e.text||el(e)}${e.importance?` · ${e.importance.toFixed(2)}`:''}</span>`).join('')}</div>`;
+    if(sh.must_topics&&sh.must_topics.length)b10+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--orange);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">📌 Must topics</div>${sh.must_topics.map(t=>`<span class="tag o">${t.topic||el(t)}</span>`).join('')}</div>`;
+    // v47.0: New semantic hint fields
+    if(sh.must_cover_concepts&&sh.must_cover_concepts.length)b10+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--gn);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px;font-weight:700">💡 Must-cover concepts (v47)</div>${sh.must_cover_concepts.slice(0,8).map(c=>{const t=typeof c==='object'?(c.text||c.entity||''):c;return`<span class="tag g">${esc(t)}</span>`}).join('')}</div>`;
+    if(sh.concept_instruction)b10+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--gn);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">🧠 Concept instruction</div><div class="s1-instr">${esc(sh.concept_instruction)}</div></div>`;
+    if(sh.primary_entity&&sh.primary_entity.entity)b10+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--pr);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">🎯 Primary entity</div><span class="s1-ent must" style="border-color:var(--pr)">${esc(sh.primary_entity.entity)} <span style="font-size:8px;opacity:.5">salience: ${(sh.primary_entity.salience||0).toFixed(2)}</span></span></div>`;
+    if(sh.checkpoints){const cp=sh.checkpoints;b10+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--mg);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">📊 Checkpoints v47</div>`;Object.entries(cp).forEach(([k,v])=>{if(k!=='version')b10+=`<div style="font-size:10px;margin:2px 0"><b style="color:var(--orange)">${esc(k)}:</b> ${esc(v)}</div>`});b10+=`</div>`}
+    if(sh.version)b10+=`<div style="margin-top:6px;font-size:9px;opacity:.3">sem_hints ${esc(sh.version)}</div>`;
+    if(!ai.gaps&&!ai.causal&&!(sh.critical_entities&&sh.critical_entities.length)&&!(sh.must_cover_concepts&&sh.must_cover_concepts.length))b10+=`<div style="color:var(--mg);font-style:italic">Agent instructions wygenerowane wewnętrznie — używane automatycznie w batch loop</div>`;
+    h+=s1Sec(10,'Instrukcje dla modelu',`${sh.version||''}`,b10);
+
+    // ─── 1️⃣1️⃣ Cluster Expansion (related_searches + topical_coverage) ───
+    let b11='';
+    const clRs=d.related_searches||[],clTc=(d.entity_seo||{}).topical_coverage||[];
+    if(clRs.length||clTc.length){
+        if(clRs.length){b11+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--pr);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px;font-weight:700">🔗 Related Searches — frazy powiązane (${clRs.length})</div><div style="display:flex;flex-wrap:wrap;gap:4px">${clRs.map(r=>`<span class="tag d" style="font-size:11px">${ss(r)}</span>`).join('')}</div></div>`}
+        if(clTc.length){const mustT=clTc.filter(t=>typeof t==='object'&&t.priority==='MUST'),highT=clTc.filter(t=>typeof t==='object'&&t.priority==='HIGH'),otherT=clTc.filter(t=>typeof t==='object'&&t.priority!=='MUST'&&t.priority!=='HIGH');b11+=`<div style="margin:8px 0"><div style="font-size:9px;color:var(--orange);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px;font-weight:700">📊 Topical Coverage — klastry tematyczne</div>`;if(mustT.length)b11+=`<div style="margin:4px 0"><span style="font-size:8px;color:var(--rd);font-weight:700">MUST:</span> ${mustT.map(t=>`<span class="tag r">${esc(t.subtopic||t.topic||'')}</span>`).join('')}</div>`;if(highT.length)b11+=`<div style="margin:4px 0"><span style="font-size:8px;color:var(--orange);font-weight:700">HIGH:</span> ${highT.map(t=>`<span class="tag o">${esc(t.subtopic||t.topic||'')}</span>`).join('')}</div>`;if(otherT.length)b11+=`<div style="margin:4px 0"><span style="font-size:8px;color:var(--mg);font-weight:700">OPTIONAL:</span> ${otherT.map(t=>`<span class="tag d">${esc(t.subtopic||t.topic||'')}</span>`).join('')}</div>`;b11+=`</div>`}
+        b11+=`<div style="margin-top:8px;font-size:10px;color:var(--mg)">💡 Potencjał klastra: ${clRs.length+clTc.length} fraz powiązanych → możliwy klaster ${Math.max(3,Math.min(15,Math.round((clRs.length+clTc.length)/3)))}–${Math.max(6,Math.min(20,Math.round((clRs.length+clTc.length)/2)))} artykułów</div>`;
+    }else{b11+=`<div style="color:var(--mg);font-style:italic">Brak danych o frazach powiązanych</div>`}
+    h+=s1Sec(11,'Potencjał klastra / Cluster Expansion',`${clRs.length+clTc.length} fraz`,b11);
+
+    // ─── 1️⃣2️⃣ Suggested Structure (from suggested_h2s + top competitor H2 patterns) ───
+    let b12='';
+    const sgH2=d.suggested_h2s||[],topH2=d.competitor_h2_patterns||[];
+    if(sgH2.length||topH2.length){
+        if(sgH2.length){b12+=`<div style="margin:6px 0"><div style="font-size:9px;color:var(--gn);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px;font-weight:700">✅ Sugerowane H2 (z gap analysis)</div>`;sgH2.forEach((h2,i)=>{b12+=`<div style="padding:3px 0;font-size:11px;color:var(--lg)"><span style="color:var(--gn);font-weight:700;width:22px;display:inline-block">${i+1}.</span>${esc(typeof h2==='string'?h2:(h2.h2||h2.title||h2.subtopic||''))}</div>`});b12+=`</div>`}
+        if(topH2.length){b12+=`<div style="margin:8px 0"><div style="font-size:9px;color:var(--mg);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">📋 Dominujące H2 u konkurencji (${topH2.length})</div>`;topH2.slice(0,10).forEach((h2,i)=>{b12+=`<div style="padding:2px 0;font-size:10px;color:var(--mg)"><span style="color:var(--orange);font-weight:700;width:18px;display:inline-block">${i+1}.</span>${el(h2)}</div>`});b12+=`</div>`}
+        // Compute recommended length range
+        const recLen=d.recommended_length||3000,medLen=d.median_length||0;
+        b12+=`<div style="margin-top:8px;padding:8px;background:var(--sb);border-radius:6px"><div style="font-size:9px;color:var(--mg);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px">📏 Rekomendowana struktura</div><div style="font-size:11px;color:var(--lg)">Sekcji H2: <b>${Math.max(sgH2.length, Math.min(10,Math.round(recLen/400)))}</b> | Długość: <b>${recLen}</b> słów | Mediana konkurencji: <b>${medLen}</b> słów</div></div>`;
+    }else{b12+=`<div style="color:var(--mg);font-style:italic">Brak danych o sugerowanej strukturze — sprawdź logi S1</div>`}
+    h+=s1Sec(12,'Sugerowana struktura artykułu',`${sgH2.length} H2`,b12);
+
+    document.getElementById('s1B').innerHTML=h;
+    // Auto-expand first section
+    document.getElementById('s1s1').classList.add('open');
+}
+
+// ═══ BATCH INSTRUCTIONS ═══
+function rBI(d){
+    document.getElementById('biP').style.display='';
+    const body=document.getElementById('biB'),cid=`bd${d.batch}`;
+    const card=document.createElement('div');card.className='bd';
+    let x=`<div style="margin:4px 0"><span class="tag p">${d.batch_type}</span><span class="tag d">${d.word_range} słów</span>`;
+    if(d.semantic_plan&&d.semantic_plan.profile)x+=`<span class="tag o">${d.semantic_plan.profile}</span>`;
+    if(d.batch_length_detail&&d.batch_length_detail.complexity_score)x+=`<span class="tag c">cmplx: ${d.batch_length_detail.complexity_score}</span>`;
+    if(d.main_keyword_ratio)x+=`<span class="tag d">MK: ${d.main_keyword_ratio}</span>`;x+=`</div>`;
+    x+=`<div class="flags">${fl('instructions',d.has_gpt_instructions,'g')}${fl('prompt',d.has_gpt_prompt,'g')}${fl('memory',d.has_article_memory,'g')}${fl('enhanced',d.has_enhanced,'g')}${fl('style',d.has_style,'g')}${fl('exp_markers',d.experience_markers,'o')}${fl('continuation',d.continuation_context,'o')}${fl('cont_v39',d.has_continuation_v39,'o')}${fl('causal',d.has_causal_context,'p')}${fl('info_gain',d.has_information_gain,'p')}${fl('smart',d.has_smart_instructions,'p')}${fl('hierarchy',d.has_phrase_hierarchy,'o')}${d.has_backend_placement?fl('placement',1,'g'):''}${d.has_cooccurrence?fl('cooccur',1,'g'):''}${d.has_concepts?fl('concepts',1,'g'):''}${d.has_legal?fl('YMYL legal',1,'r'):''}${d.has_medical?fl('YMYL med',1,'r'):''}</div>`;
+    x+=`<div class="sub"><div class="sub-t">MUST (${d.must_keywords.length})</div>${kc(d.must_keywords,'must')}</div>`;
+    x+=`<div class="sub"><div class="sub-t">EXTENDED (${d.extended_keywords.length})</div>${kc(d.extended_keywords,'ext')}</div>`;
+    if(d.stop_keywords&&d.stop_keywords.length)x+=`<div class="sub"><div class="sub-t">STOP</div>${kc(d.stop_keywords,'stop')}</div>`;
+    if(d.caution_keywords&&d.caution_keywords.length)x+=`<div class="sub"><div class="sub-t">CAUTION</div>${kc(d.caution_keywords,'ext')}</div>`;
+    if(d.entities_to_define&&d.entities_to_define.length)x+=`<div class="sub"><div class="sub-t">Entities</div>${d.entities_to_define.map(e=>`<span class="tag o">${el(e)}</span>`).join('')}</div>`;
+    if(d.relations_to_establish&&d.relations_to_establish.length)x+=`<div class="sub"><div class="sub-t">Relations</div>${d.relations_to_establish.map(r=>`<span class="tag p">${el(r)}</span>`).join('')}</div>`;
+    if(d.paa_from_serp&&d.paa_from_serp.length)x+=`<div class="sub"><div class="sub-t">PAA</div>${d.paa_from_serp.map(q=>`<div style="color:var(--lg);font-size:10px">• ${el(q)}</div>`).join('')}</div>`;
+    if(d.coverage&&(d.coverage.basic!==undefined||d.coverage.overall!==undefined)){
+        // FIX: Extract numeric value from coverage (may be object {percent:X} or number)
+        const cv=v=>{if(typeof v==='number')return v.toFixed(1);if(v&&typeof v==='object')return(v.percent||v.pct||v.value||0).toFixed(1);return'?'};
+        const cn=v=>{const n=parseFloat(cv(v));return isNaN(n)?0:n};
+        x+=`<div class="sub"><div class="sub-t">Coverage</div>`;
+        if(d.coverage.basic!==undefined)x+=`<span class="tag ${cn(d.coverage.basic)>50?'g':'w'}">Basic: ${cv(d.coverage.basic)}%</span>`;
+        if(d.coverage.extended!==undefined)x+=`<span class="tag ${cn(d.coverage.extended)>50?'g':'w'}">Ext: ${cv(d.coverage.extended)}%</span>`;
+        if(d.coverage.overall!==undefined)x+=`<span class="tag ${cn(d.coverage.overall)>70?'g':'w'}">All: ${cv(d.coverage.overall)}%</span>`;
+        x+=`</div>`}
+    if(d.article_memory_summary){const am=d.article_memory_summary;x+=`<div class="sub"><div class="sub-t">Article Memory</div>${am.word_count?`<span class="tag d">${am.word_count} słów</span>`:''}${am.h2_completed&&am.h2_completed.length?am.h2_completed.map(h=>`<span class="tag g">${esc(h)}</span>`).join(''):''}${am.preview?`<div class="pre">${esc(am.preview)}</div>`:''}</div>`}
+    if(d.style_summary){const s=d.style_summary;x+=`<div class="sub"><div class="sub-t">Style</div>${s.tone?`<span class="tag o">${esc(s.tone)}</span>`:''}${s.overused_words&&s.overused_words.length?s.overused_words.map(w=>`<span class="tag r">${esc(w)}</span>`).join(''):''}</div>`}
+    if(d.continuation_preview){const cp=d.continuation_preview;x+=`<div class="sub"><div class="sub-t">Kontynuacja</div>${cp.last_topic?`<span class="tag d">${esc(cp.last_topic)}</span>`:''}${cp.transition_hint?`<span class="tag o">${esc(cp.transition_hint)}</span>`:''}</div>`}
+    if(d.legal_context_preview)x+=`<div class="sub"><div class="sub-t">⚖️ Legal</div><span class="tag r">Active</span>${d.legal_context_preview.instruction_preview?`<div class="pre">${esc(d.legal_context_preview.instruction_preview)}</div>`:''}</div>`;
+    if(d.medical_context_preview)x+=`<div class="sub"><div class="sub-t">🏥 Medical</div><span class="tag r">Active</span>${d.medical_context_preview.instruction_preview?`<div class="pre">${esc(d.medical_context_preview.instruction_preview)}</div>`:''}</div>`;
+    if(d.phrase_hierarchy_data)x+=`<div class="sub"><div class="sub-t">Hierarchy</div>${d.phrase_hierarchy_data.strategy?`<span class="tag p">${esc(d.phrase_hierarchy_data.strategy)}</span>`:''}${(d.phrase_hierarchy_data.roots_covered||[]).map(r=>`<span class="tag c">${ss(r)}</span>`).join('')}</div>`;
+    if(d.intro_guidance)x+=`<div class="sub"><div class="sub-t">Intro</div><div class="pre">${esc(d.intro_guidance.substring(0,250))}</div></div>`;
+    if(d.causal_context_preview)x+=`<div class="sub"><div class="sub-t">Causal</div><div class="pre">${esc(d.causal_context_preview)}</div></div>`;
+    if(d.information_gain_preview)x+=`<div class="sub"><div class="sub-t">Info Gain</div><div class="pre">${esc(d.information_gain_preview)}</div></div>`;
+    if(d.smart_instructions_preview)x+=`<div class="sub"><div class="sub-t">Smart Instr</div><div class="pre">${esc(d.smart_instructions_preview)}</div></div>`;
+    if(d.gpt_instructions_preview)x+=`<div class="sub"><div class="sub-t">GPT Instr v39</div><div class="pre">${esc(d.gpt_instructions_preview)}</div></div>`;
+    if(d.h2_remaining&&d.h2_remaining.length>1)x+=`<div class="sub"><div class="sub-t">H2 remaining</div>${d.h2_remaining.slice(1).map(h=>`<span class="tag d">${esc(h)}</span>`).join('')}</div>`;
+    card.innerHTML=`<div class="bd-h" onclick="tBd('${cid}')"><span><strong style="color:var(--orange)">B${d.batch}</strong>/${d.total} · <span class="tag p" style="margin:0">${esc(d.batch_type)}</span> · <span style="color:var(--lg)">${esc(d.h2)}</span></span><span style="color:var(--mg)">▸</span></div><div class="bd-b" id="${cid}">${x}</div>`;
+    body.appendChild(card);
+}
+
+// ═══ S1 COMPLIANCE ═══
+function rCP(d){
+    document.getElementById('cpP').style.display='';
+    const body=document.getElementById('cpB'),s=d.summary||{};
+    let h=`<div class="cg">
+        <div class="cs"><div class="v" style="color:${fc(s.entities||'0/0')}">${s.entities||'—'}</div><div class="lb">Encje</div></div>
+        <div class="cs"><div class="v" style="color:${fc(s.entities_must||'0/0')}">${s.entities_must||'—'}</div><div class="lb">Must</div></div>
+        <div class="cs"><div class="v" style="color:${fc(s.causal_triplets||'0/0')}">${s.causal_triplets||'—'}</div><div class="lb">Causal</div></div>
+        <div class="cs"><div class="v" style="color:${fc(s.content_gaps||'0/0')}">${s.content_gaps||'—'}</div><div class="lb">Gaps</div></div>
+        <div class="cs"><div class="v" style="color:${fc(s.ngrams||'0/0')}">${s.ngrams||'—'}</div><div class="lb">N-gram</div></div>
+        <div class="cs"><div class="v" style="color:${fc(s.paa||'0/0')}">${s.paa||'—'}</div><div class="lb">PAA</div></div>
+        <div class="cs"><div class="v" style="color:${fc(s.semantic_keyphrases||'0/0')}">${s.semantic_keyphrases||'—'}</div><div class="lb">Sem KP</div></div>
+        <div class="cs"><div class="v" style="color:var(--orange)">${s.editorial_score||'—'}</div><div class="lb">Editorial</div></div>
+    </div>`;
+    if(d.entities&&d.entities.length)h+=`<div class="sec"><div class="sec-t">Encje</div>${d.entities.map(e=>`<div class="cr ${e.found?'ok':'no'}"><span class="i">${e.found?'✓':'✗'}</span><span class="l">${e.entity}${e.must?' <span class="tag r" style="font-size:8px;padding:1px 6px">MUST</span>':''}</span></div>`).join('')}</div>`;
+    if(d.causal_triplets&&d.causal_triplets.length)h+=`<div class="sec"><div class="sec-t">Causal Triplets</div>${d.causal_triplets.map(t=>{const st=t.fulfilled?'ok':(t.cause_found||t.effect_found?'half':'no');return`<div class="cr ${st}"><span class="i">${t.fulfilled?'✓':(t.cause_found||t.effect_found?'~':'✗')}</span><span class="l"><span style="color:${t.cause_found?G:R}">${t.cause}</span> → <span style="color:${t.effect_found?G:R}">${t.effect}</span></span></div>`}).join('')}</div>`;
+    if(d.ngrams&&d.ngrams.length)h+=`<div class="sec"><div class="sec-t">N-gramy</div>${d.ngrams.map(n=>`<div class="cr ${n.found?'ok':'no'}"><span class="i">${n.found?'✓':'✗'}</span><span class="l">${n.ngram}</span>${n.weight?`<span class="p">${n.weight}</span>`:''}</div>`).join('')}</div>`;
+    if(d.semantic_keyphrases&&d.semantic_keyphrases.length)h+=`<div class="sec"><div class="sec-t">Semantic KP</div>${d.semantic_keyphrases.map(k=>`<div class="cr ${k.found?'ok':'no'}"><span class="i">${k.found?'✓':'✗'}</span><span class="l">${k.phrase}</span></div>`).join('')}</div>`;
+    if(d.paa_questions&&d.paa_questions.length)h+=`<div class="sec"><div class="sec-t">PAA</div>${d.paa_questions.map(p=>`<div class="cr ${p.addressed?'ok':'no'}"><span class="i">${p.addressed?'✓':'✗'}</span><span class="l">${p.question}</span><span class="p">${p.coverage_pct}%</span></div>`).join('')}</div>`;
+    if(d.content_gaps_h2&&d.content_gaps_h2.length)h+=`<div class="sec"><div class="sec-t">H2 Gaps</div>${d.content_gaps_h2.map(g=>`<div class="cr ${g.covered?'ok':(g.coverage_pct>25?'half':'no')}"><span class="i">${g.covered?'✓':(g.coverage_pct>25?'~':'✗')}</span><span class="l">${g.h2}</span><span class="p">${g.coverage_pct}%</span></div>`).join('')}</div>`;
+    if(d.content_gaps_paa&&d.content_gaps_paa.length)h+=`<div class="sec"><div class="sec-t">PAA Gaps</div>${d.content_gaps_paa.map(p=>`<div class="cr ${p.answered?'ok':'no'}"><span class="i">${p.answered?'✓':'✗'}</span><span class="l">${p.question}</span><span class="p">${p.coverage_pct}%</span></div>`).join('')}</div>`;
+    body.innerHTML=h;
+    if(!body.classList.contains('open'))tPnl('cpP');
+}
+
+// ═══ WORKFLOW ═══
+function stopWF(){if(es){es.close();es=null}log('⛔ Zatrzymano');document.getElementById('btnStart').disabled=false;document.getElementById('btnStart').textContent='Uruchom workflow →';document.getElementById('btnStop').style.display='none'}
+function pt(t){return t.split('\n').map(l=>l.trim()).filter(l=>l.length>0)}
+
+async function startWorkflow(){
+    const kw=document.getElementById('mainKeyword').value.trim();
+    if(!kw){alert('Wpisz keyword!');return}
+    const h2=(document.getElementById('h2Structure').value.trim()||'').split('\n').map(l=>l.trim()).filter(l=>l);
+    const bt=pt(document.getElementById('basicTerms').value.trim());
+    const et=pt(document.getElementById('extendedTerms').value.trim());
+    const ci=document.getElementById('customInstr').value.trim();
+
+    document.getElementById('btnStart').disabled=true;document.getElementById('btnStart').textContent='Workflow w toku…';
+    document.getElementById('btnStop').style.display='';
+    document.getElementById('wel').style.display='none';document.getElementById('prog').style.display='';
+
+    for(let i=1;i<=10;i++)uStep(i,'pending','—');
+    ['logC','bRes','biB','s1B','cpB'].forEach(id=>document.getElementById(id).innerHTML='');
+    ['bpC','edC','frC','h2C','s1P','biP','cpP','esC','afC','ymC','schP','tmP','ciP','doneB','expB','artP'].forEach(id=>document.getElementById(id).style.display='none');
+    document.getElementById('editorWrap').classList.remove('visible');
+    document.getElementById('chatHist').innerHTML='<div class="chat-msg ai">Artykuł gotowy! Napisz co chcesz zmienić, albo zaznacz fragment tekstu powyżej.<div class="meta">💡 zaznacz tekst w podglądzie → pojawi się mini-edytor</div></div>';
+    document.getElementById('valResult').classList.remove('vis');
+    rawArticle='';selTxt='';s1Data=null;batchLog=[];finalData=null;salienceData=null;styleData=null;memoryData=null;articleData=null;editorialData=null;stepTimingData=null;paaData=null;ymylCtxData=null;ymylAnalysisData=null;ymylValData=null;liveArticle='';
+    log(`Start: "${kw}" [${mode}] [${engine}] [temp=${temperature}]`);
+
+    try{
+        const resp=await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({main_keyword:kw,mode:mode,engine:engine,openai_model:engine==='openai'?openaiModel:null,temperature:temperature,h2_structure:h2,basic_terms:bt,extended_terms:et,custom_instructions:ci})});
+        const data=await resp.json();
+        if(!resp.ok||data.error){log(`❌ ${data.error||'Server error '+resp.status}`);document.getElementById('btnStart').disabled=false;document.getElementById('btnStart').textContent='Uruchom workflow →';if(resp.status===429)log('⏳ Poczekaj na zakończenie bieżącego workflow');return}
+        jid=data.job_id;log(`Job: ${jid}`);
+
+        const par=new URLSearchParams();par.set('basic_terms',JSON.stringify(bt));par.set('extended_terms',JSON.stringify(et));
+        if(es)es.close();es=new EventSource(`/api/stream/${jid}?${par.toString()}`);
+
+        es.addEventListener('step',e=>{const d=JSON.parse(e.data);uStep(d.step,d.status,d.detail||'')});
+        es.addEventListener('log',e=>{log(JSON.parse(e.data).msg)});
+        es.addEventListener('project',e=>{const d=JSON.parse(e.data);tb=d.total_batches;log(`Project: ${d.project_id}`);const r=document.getElementById('bRes');r.innerHTML='';for(let i=1;i<=tb;i++)r.innerHTML+=`<div class="bchip pend" id="bc${i}">B${i}</div>`});
+        es.addEventListener('h2_plan',e=>{const d=JSON.parse(e.data);document.getElementById('h2C').style.display='';document.getElementById('h2L').innerHTML=d.h2_list.map((h,i)=>`<div style="padding:4px 0;border-bottom:1px solid var(--w5);font-size:13px"><span style="color:var(--orange);font-weight:700">${i+1}.</span> ${esc(h)}</div>`).join('')});
+        es.addEventListener('auto_basic_terms',e=>{const d=JSON.parse(e.data);if(d.terms&&d.terms.length){const ta=document.getElementById('basicTerms');ta.value=d.terms.join('\n');ta.rows=Math.min(12,d.terms.length+1);document.getElementById('bsc').style.display=''}});
+        es.addEventListener('s1_data',e=>{s1Data=JSON.parse(e.data);rS1(s1Data);const p=document.getElementById('s1P'),b=p.querySelector('.pnl-b'),h=p.querySelector('.pnl-h');if(!b.classList.contains('open')){b.classList.add('open');h.classList.add('open')}});
+        es.addEventListener('batch_instructions',e=>{rBI(JSON.parse(e.data))});
+        es.addEventListener('batch_start',e=>{const d=JSON.parse(e.data);document.getElementById('bpC').style.display='';document.getElementById('bCt').textContent=`${d.batch}/${d.total}`;document.getElementById('bFill').style.width=((d.batch-1)/d.total*100)+'%'});
+        es.addEventListener('batch_result',e=>{const d=JSON.parse(e.data);batchLog.push(d);const c=document.getElementById(`bc${d.batch}`);if(c){c.className=`bchip ${d.accepted?'ok':'bad'}`;c.textContent=`B${d.batch} ${d.quality_score||'?'}`;c.title=`${d.quality_grade||'?'} | D:${d.depth_score||'?'}`}document.getElementById('bFill').style.width=(d.batch/tb*100)+'%';document.getElementById('bCt').textContent=`${d.batch}/${tb}`;const bd=document.getElementById(`bd${d.batch}`);if(bd){let rx=`<div class="sub" style="border-top:2px solid ${d.accepted?'var(--gn)':'var(--rd)'}"><div class="sub-t">${d.accepted?'✅':'❌'} Wynik: ${d.quality_score||'?'}/100 (${d.quality_grade||'?'}) | ${d.word_count||'?'} słów | Depth: ${d.depth_score||'?'}</div>`;if(d.exceeded&&d.exceeded.length)rx+=`<div style="margin:4px 0">${d.exceeded.map(k=>'<span class="chip must">'+esc(k)+'</span>').join('')}</div>`;rx+=`</div>`;bd.innerHTML+=rx;if(!bd.classList.contains('open'))bd.classList.add('open')}if(d.accepted&&d.text_preview){liveArticle+=(liveArticle?'\n\n':'')+d.text_preview;renderArt(liveArticle)}});
+        es.addEventListener('editorial',e=>{const d=JSON.parse(e.data);editorialData=d;document.getElementById('edC').style.display='';document.getElementById('edSc').innerHTML=`${d.score}<span>/10</span>`;document.getElementById('edCh').textContent=`${d.changes_applied}/${d.changes_applied+d.changes_failed}`;document.getElementById('edW').textContent=`${d.word_count_before||'?'}→${d.word_count_after||'?'}`;document.getElementById('edR').textContent=d.rollback?'⚠️ TAK':'✓ NIE';const det=document.getElementById('edDet');let h='';if(d.summary)h+=`<div style="margin-bottom:8px;color:var(--mg)"><b>Podsumowanie:</b> ${esc(typeof d.summary==='string'?d.summary:d.summary.summary||'')}</div>`;if(d.applied_changes&&d.applied_changes.length){h+=`<div style="font-weight:700;color:var(--gn);margin-bottom:4px">✅ Zastosowane zmiany (${d.applied_changes.length}):</div>`;d.applied_changes.slice(0,10).forEach((c,i)=>{const f=c.find||c.original||c.ZNAJDŹ||'';const r=c.replace||c.corrected||c.ZAMIEŃ||'';if(f||r)h+=`<div style="margin:4px 0;padding:4px 6px;background:var(--bg2);border-radius:4px;font-size:10px"><span style="color:var(--rd);text-decoration:line-through">${esc(f.substring(0,80))}${f.length>80?'…':''}</span> → <span style="color:var(--gn)">${esc(r.substring(0,80))}${r.length>80?'…':''}</span></div>`})}if(d.failed_changes&&d.failed_changes.length){h+=`<div style="font-weight:700;color:var(--rd);margin:8px 0 4px">❌ Nieznalezione (${d.failed_changes.length}):</div>`;d.failed_changes.slice(0,5).forEach(c=>{const f=c.find||c.original||c.ZNAJDŹ||'';if(f)h+=`<div style="margin:2px 0;padding:2px 6px;font-size:10px;color:var(--rd);opacity:.7">${esc(f.substring(0,60))}…</div>`})}if(d.errors_found&&d.errors_found.length){h+=`<div style="font-weight:700;margin:8px 0 4px">🔍 Znalezione problemy:</div>`;d.errors_found.slice(0,8).forEach(err=>{const desc=typeof err==='string'?err:(err.description||err.error||err.type||'');const tp=typeof err==='object'?(err.type||''):'';h+=`<div style="margin:2px 0;font-size:10px">${tp?`<span style="color:var(--orange);font-weight:600">[${esc(tp)}]</span> `:''}${esc(desc.substring(0,100))}</div>`})}if(d.grammar_fixes>0||d.grammar_removed&&d.grammar_removed.length){h+=`<div style="margin:8px 0 4px;font-size:10px;color:var(--mg)">🔤 Gramatyka: ${d.grammar_fixes||0} poprawek`;if(d.grammar_removed&&d.grammar_removed.length)h+=` | Usunięte frazy: ${d.grammar_removed.map(p=>'"'+esc(p)+'"').join(', ')}`;h+=`</div>`}if(!h)h='<div style="color:var(--mg)">Brak szczegółów — kliknij aby odświeżyć</div>';det.innerHTML=h;det.style.display='block'});
+        es.addEventListener('final_review',e=>{const d=JSON.parse(e.data);finalData=d;document.getElementById('frC').style.display='';document.getElementById('frS').textContent=`${d.score}/100`;document.getElementById('frSt').textContent=d.status;document.getElementById('frSt').style.color=d.status==='PASS'?G:d.status==='WARN'?W:R;document.getElementById('frM').textContent=d.missing_keywords_count||0;document.getElementById('frI').textContent=d.issues_count||0;let dt='';if(d.missing_keywords&&d.missing_keywords.length)dt+=`<div>Brakujące: ${esc(d.missing_keywords.map(k=>typeof k==='string'?k:k.keyword||JSON.stringify(k)).join(', '))}</div>`;if(d.issues&&d.issues.length)dt+=`<div>Issues: ${esc(d.issues.map(i=>typeof i==='string'?i:i.message||JSON.stringify(i)).join('; '))}</div>`;document.getElementById('frD').innerHTML=dt;const qb=d.quality_breakdown;if(qb){const barsEl=document.getElementById('frBars');const labels={keywords:['Keywords',15],humanness:['Humanness',20],grammar:['Grammar',10],structure:['Structure',15],semantic:['Semantic',20],depth:['Depth',10],coherence:['Coherence',10]};let bh='';for(const[k,[label,weight]] of Object.entries(labels)){const v=qb[k];if(v!=null){const pct=Math.min(100,Math.max(0,v));const clr=pct>=80?G:pct>=60?W:R;bh+=`<div style="color:var(--mg)">${label} <span style="opacity:.5">${weight}%</span></div><div style="background:var(--bd);border-radius:3px;height:6px;overflow:hidden"><div style="width:${pct}%;height:100%;background:${clr};border-radius:3px"></div></div><div style="text-align:right;font-weight:600">${Math.round(pct)}</div>`;}}if(bh){barsEl.innerHTML=bh;document.getElementById('frQB').style.display='';}}});
+        es.addEventListener('s1_compliance',e=>{rCP(JSON.parse(e.data))});
+        es.addEventListener('article',e=>{const d=JSON.parse(e.data);articleData=d;rawArticle=d.text||'';liveArticle=rawArticle;renderArt(rawArticle);document.getElementById('editorWrap').classList.add('visible')});
+        es.addEventListener('article_memory',e=>{memoryData=JSON.parse(e.data)});
+        es.addEventListener('paa_data',e=>{paaData=JSON.parse(e.data)});
+        es.addEventListener('ymyl_context',e=>{ymylCtxData=JSON.parse(e.data)});
+        es.addEventListener('ymyl_analysis',e=>{ymylAnalysisData=JSON.parse(e.data);renderYmylCard()});
+        es.addEventListener('ymyl_validation',e=>{ymylValData=JSON.parse(e.data)});
+        es.addEventListener('entity_salience',e=>{const d=JSON.parse(e.data);salienceData=d;const el=document.getElementById('esC');el.style.display='';if(!d.enabled){document.getElementById('esSc').textContent='N/A';document.getElementById('esSal').textContent='brak API';document.getElementById('esDom').textContent='—';document.getElementById('esIss').innerHTML=`<div style="color:var(--mg)">💡 ${esc(d.message||'Ustaw GOOGLE_NLP_API_KEY')}</div>`}else{document.getElementById('esSc').textContent=`${d.score}/100`;document.getElementById('esSc').style.color=d.score>=70?G:d.score>=40?W:R;document.getElementById('esSal').textContent=d.main_salience!=null?d.main_salience.toFixed(2):'?';document.getElementById('esSal').style.color=d.main_salience>=0.25?G:d.main_salience>=0.10?W:R;document.getElementById('esDom').textContent=d.is_dominant?'✅ TAK':'❌ NIE';document.getElementById('esDom').style.color=d.is_dominant?G:R;if(d.entities&&d.entities.length){const el2=document.getElementById('esEnts');el2.style.display='';let h='<div style="font-weight:600;margin-bottom:4px">Top encje (Google NLP):</div><div style="display:grid;grid-template-columns:1fr 60px 60px 40px;gap:2px 6px;font-size:10px"><div style="font-weight:600">Encja</div><div style="font-weight:600">Salience</div><div style="font-weight:600">Typ</div><div style="font-weight:600">KG</div>';d.entities.slice(0,8).forEach(en=>{const isMain=en.name.toLowerCase().includes((d.main_keyword||'').toLowerCase());const clr=isMain?'font-weight:700;color:var(--pr)':'';h+=`<div style="${clr}">${esc(en.name)}</div><div style="${clr}">${en.salience.toFixed(3)}</div><div>${en.type}</div><div>${en.has_kg?'✓':en.has_wikipedia?'W':'—'}</div>`});h+='</div>';el2.innerHTML=h}let iss='';if(d.issues&&d.issues.length)iss+=d.issues.map(i=>`<div style="color:${R};margin-top:4px">⚠️ ${esc(i)}</div>`).join('');if(d.recommendations&&d.recommendations.length)iss+=d.recommendations.map(r=>`<div style="color:var(--mg);margin-top:2px">💡 ${esc(r)}</div>`).join('');document.getElementById('esIss').innerHTML=iss}const sp=d.subject_position;if(sp&&sp.total_sentences>0){document.getElementById('esSP').style.display='';document.getElementById('spSc').textContent=`${sp.score}/100`;document.getElementById('spSc').style.color=sp.score>=70?G:sp.score>=40?W:R;document.getElementById('spSR').textContent=`${Math.round(sp.subject_ratio*100)}%`;document.getElementById('spSR').style.color=sp.subject_ratio>=0.35?G:sp.subject_ratio>=0.2?W:R;document.getElementById('spH2').textContent=sp.h2_entity_count||0;document.getElementById('sp1st').textContent=sp.first_sentence_has_entity?'✅':'❌';document.getElementById('sp1st').style.color=sp.first_sentence_has_entity?G:R}});
+        es.addEventListener('style_analysis',e=>{const d=JSON.parse(e.data);styleData=d;document.getElementById('afC').style.display='';document.getElementById('afSc').textContent=`${d.score}/100`;document.getElementById('afSc').style.color=d.score>=75?G:d.score>=50?W:R;document.getElementById('afCV').textContent=d.cv_sentences!=null?d.cv_sentences.toFixed(2):'?';const cvOk=d.cv_sentences>=0.25&&d.cv_sentences<=0.5;document.getElementById('afCV').style.color=cvOk?G:d.cv_sentences>0.6?R:W;document.getElementById('afP').textContent=d.passive_ratio!=null?Math.round(d.passive_ratio*100)+'%':'?';document.getElementById('afP').style.color=d.passive_ratio<=0.2?G:d.passive_ratio<=0.3?W:R;document.getElementById('afSL').textContent=d.avg_sentence_length!=null?d.avg_sentence_length.toFixed(0):'?';let iss='';if(d.issues&&d.issues.length)iss=d.issues.map(i=>`<div style="margin-top:3px">⚠️ ${esc(i)}</div>`).join('');document.getElementById('afIss').innerHTML=iss});
+        es.addEventListener('schema_org',e=>{const d=JSON.parse(e.data);document.getElementById('schP').style.display='';document.getElementById('schCode').textContent=d.html||JSON.stringify(d.json_ld,null,2)});
+        es.addEventListener('topical_map',e=>{const d=JSON.parse(e.data);document.getElementById('tmP').style.display='';let h=`<div style="font-size:11px"><div style="font-weight:600;margin-bottom:8px">🏛️ Filar: "${esc(d.pillar.entity)}" | ${d.total_clusters} klastrów</div>`;const prio={'HIGH':'🔴','MEDIUM':'🟡','LOW':'🟢'};d.clusters.forEach(c=>{h+=`<div style="padding:4px 0;border-bottom:1px solid var(--bd)"><span>${prio[c.priority]||'⚪'}</span> <b>${esc(c.entity)}</b><br><span style="color:var(--mg);font-size:10px">${esc(c.relation_to_pillar)} · źródło: ${c.source}</span></div>`});if(d.internal_links&&d.internal_links.length){h+=`<div style="margin-top:10px;font-weight:600">🔗 Sugerowane linki wewnętrzne (${d.internal_links.length}):</div>`;d.internal_links.slice(0,10).forEach(l=>{h+=`<div style="font-size:10px;color:var(--mg);padding:2px 0">${esc(l.from_page)} → ${esc(l.to_page)} | anchor: "${esc(l.anchor_text)}"</div>`})}h+='</div>';document.getElementById('tmB').innerHTML=h});
+        es.addEventListener('done',e=>{const d=JSON.parse(e.data);stepTimingData=d.timing||null;renderCompDash();document.getElementById('doneB').style.display='';const tm=d.timing;const tmStr=tm?` · ${Math.round(tm.total_seconds)}s`:'';document.getElementById('doneD').textContent=`${d.project_id} · ${d.word_count} słów${tmStr}`;if(d.exports){document.getElementById('expB').style.display='';if(d.exports.html)document.getElementById('exH').href=`/api/export/${jid}/html`;if(d.exports.docx)document.getElementById('exD').href=`/api/export/${jid}/docx`}document.getElementById('btnStart').disabled=false;document.getElementById('btnStart').textContent='Uruchom workflow →';document.getElementById('btnStop').style.display='none';es.close()});
+        es.addEventListener('workflow_error',e=>{const d=JSON.parse(e.data);log(`❌ ${d.msg}`);if(d.step)uStep(d.step,'error',d.msg);document.getElementById('btnStart').disabled=false;document.getElementById('btnStart').textContent='Uruchom workflow →';document.getElementById('btnStop').style.display='none';es.close()});
+
+        let rr=0;
+        es.onerror=()=>{rr++;if(rr>2||es.readyState===EventSource.CLOSED){log(`❌ SSE lost (${rr}x) — workflow continues server-side`);es.close();es=null;document.getElementById('btnStart').disabled=false;document.getElementById('btnStart').textContent='Uruchom workflow →';document.getElementById('btnStop').style.display='none'}else{log(`⚠️ Reconnect ${rr}/2`)}};
+        es.onopen=()=>{if(rr>0){log('✅ Reconnected');rr=0}};
+    }catch(err){log(`❌ ${err.message}`);document.getElementById('btnStart').disabled=false;document.getElementById('btnStart').textContent='Uruchom workflow →';document.getElementById('btnStop').style.display='none'}
+}
+
+// ═══ ARTICLE EDITOR ═══
+// ═══ YMYL INTELLIGENCE CARD ═══
+function renderYmylCard(){
+    const d=ymylAnalysisData;if(!d)return;
+    const lr=d.legal||{};const mr=d.medical||{};
+    const hasL=lr.score!=null&&lr.score>0;const hasM=mr.score!=null&&mr.score>0;
+    if(!hasL&&!hasM)return;
+    document.getElementById('ymC').style.display='';
+    document.getElementById('ymLS').textContent=hasL?`${lr.score}/100`:'—';
+    if(hasL)document.getElementById('ymLS').style.color=lr.score>=70?G:lr.score>=40?W:R;
+    document.getElementById('ymMS').textContent=hasM?`${mr.score}/100`:'—';
+    if(hasM)document.getElementById('ymMS').style.color=mr.score>=70?G:mr.score>=40?W:R;
+    const totalRefs=(lr.acts_found||[]).length+(lr.judgments_found||[]).length+(mr.pmids_found||[]).length+(mr.studies_referenced||[]).length;
+    document.getElementById('ymR').textContent=totalRefs;
+    const hasDisclaimer=(hasL&&lr.disclaimer_present)||(hasM&&mr.disclaimer_present);
+    document.getElementById('ymD').textContent=hasDisclaimer?'✅':'❌';
+    document.getElementById('ymD').style.color=hasDisclaimer?G:R;
+    let detail='';
+    if(hasL){detail+=`<div>⚖️ Akty prawne: ${(lr.acts_found||[]).length} · Orzeczenia: ${(lr.judgments_found||[]).length} · Przepisy: ${(lr.articles_cited||[]).length}</div>`}
+    if(hasM){detail+=`<div>🏥 Publikacje PMID: ${(mr.pmids_found||[]).length} · Badania: ${(mr.studies_referenced||[]).length} · Instytucje: ${(mr.institutions_found||[]).length}</div>`}
+    document.getElementById('ymDetail').innerHTML=detail;
+}
+
+// ═══ COMPETITIVE INTELLIGENCE DASHBOARD v2.0 ═══
+// 7-panel comprehensive dashboard with all backend data
+function ciSec(num,title,badge,content){
+    return `<div class="ci-sec"><div class="ci-sec-h" onclick="this.nextElementSibling.classList.toggle('open');this.querySelector('.arr').textContent=this.nextElementSibling.classList.contains('open')?'▲':'▼'"><span class="ci-sec-n"><b>${num}</b> ${title}</span>${badge?`<span class="ci-badge">${badge}</span>`:''}<span class="arr">▼</span></div><div class="ci-sec-b">${content}</div></div>`;
+}
+function ciBar(pct,clr){return `<div style="background:var(--bd);border-radius:3px;height:7px;overflow:hidden"><div style="width:${Math.min(100,Math.max(0,pct))}%;height:100%;background:${clr};border-radius:3px"></div></div>`}
+function ciGrid(cols){return `<div style="display:grid;grid-template-columns:${cols};gap:3px 8px;font-size:10px;align-items:center">`}
+function ciStat(val,label,clr){return `<div style="text-align:center"><div style="font-size:18px;font-weight:800;${clr?'color:'+clr:''}">${val}</div><div style="font-size:9px;color:var(--mg)">${label}</div></div>`}
+
+function renderCompDash(){
+    if(!s1Data&&!finalData&&!batchLog.length)return;
+    document.getElementById('ciP').style.display='';
+    const G='#34d399',W='#fba92c',R='#f87171',P='#fba92c',M='#9e9e9e';
+    const clrV=(v,g,w)=>v>=g?G:v>=w?W:R;
+    let h='<style>.ci-sec{border:1px solid var(--bd);border-radius:8px;margin-bottom:8px;overflow:hidden}.ci-sec-h{padding:8px 12px;cursor:pointer;display:flex;align-items:center;gap:8px;font-size:12px;background:var(--bg2)}.ci-sec-h:hover{opacity:.8}.ci-sec-n{flex:1}.ci-sec-n b{color:var(--pr);margin-right:4px}.ci-badge{font-size:10px;padding:1px 8px;border-radius:10px;background:var(--bd);font-weight:600}.ci-sec-b{display:none;padding:10px 12px;font-size:11px}.ci-sec-b.open{display:block}.ci-kw-row{display:grid;grid-template-columns:1fr 55px 35px 35px 55px;gap:2px 6px;padding:2px 0;border-bottom:1px solid var(--bd);font-size:10px;align-items:center}</style>';
+
+    // ════════════════════════════════════════════
+    // PANEL 1: PROJECT INTELLIGENCE OVERVIEW
+    // ════════════════════════════════════════════
+    let p1='';
+    const fr=finalData||{};const qb=fr.quality_breakdown||{};
+    const art=articleData||{};
+    const salS=(salienceData&&salienceData.enabled)?salienceData.score:null;
+    const spS=salienceData&&salienceData.subject_position?salienceData.subject_position.score:null;
+    const stS=styleData?styleData.score:null;
+
+    // 1A: Global Quality Score
+    const overallScore=fr.score||0;
+    const grade=overallScore>=90?'A+':overallScore>=80?'A':overallScore>=70?'B+':overallScore>=60?'B':overallScore>=50?'C':'D';
+    const recLen=(s1Data&&s1Data.recommended_length)||'?';
+    const wordCount=art.word_count||fr.word_count||0;
+    const wcClr=recLen!=='?'?clrV(wordCount/recLen*100,85,60):M;
+
+    p1+=`<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr;gap:12px;margin-bottom:14px">`;
+    p1+=ciStat(`${overallScore}<span style="font-size:12px">/100</span>`,'Quality Score',clrV(overallScore,75,50));
+    p1+=ciStat(grade,'Grade',clrV(overallScore,75,50));
+    p1+=ciStat(`${wordCount}<span style="font-size:10px;color:${M}">/${recLen}</span>`,'Words',wcClr);
+    p1+=ciStat(mode||'standard','Mode',null);
+    p1+=ciStat(engine==='openai'?'GPT':'Claude','Engine','#fba92c');
+    p1+=ciStat((temperature||0.7).toFixed(1),'Temp',null);
+    p1+=`</div>`;
+
+    // 1B: All metrics radar
+    const allScores=[
+        ['Quality',fr.score],['Keywords',qb.keywords],['Humanness',qb.humanness],
+        ['Grammar',qb.grammar],['Structure',qb.structure],['Semantic',qb.semantic],
+        ['Depth',qb.depth],['Coherence',qb.coherence],
+    ];
+    if(salS!=null)allScores.push(['Entity Sal.',salS]);
+    if(spS!=null)allScores.push(['Subject Pos.',spS]);
+    if(stS!=null)allScores.push(['Style',stS]);
+    const validScores=allScores.filter(s=>s[1]!=null);
+    const avgAll=validScores.length?Math.round(validScores.reduce((a,s)=>a+s[1],0)/validScores.length):0;
+
+    p1+=ciGrid('100px 1fr 36px');
+    validScores.forEach(([label,val])=>{const clr=clrV(val,80,60);p1+=`<div style="color:${M}">${label}</div>${ciBar(val,clr)}<div style="text-align:right;font-weight:700;color:${clr}">${Math.round(val)}</div>`});
+    p1+=`</div>`;
+    p1+=`<div style="text-align:center;margin-top:8px;font-size:10px;color:${M}">Średnia: <b style="color:${clrV(avgAll,75,50)}">${avgAll}/100</b></div>`;
+
+    h+=ciSec('1️⃣','Project Intelligence Overview',`${overallScore}/100 ${grade}`,p1);
+
+    // ════════════════════════════════════════════
+    // PANEL 2: KEYWORD CONTROL PANEL
+    // ════════════════════════════════════════════
+    let p2='';
+    const cov=art.coverage||{};const dens=art.density||fr.density||{};
+    // Show coverage summary
+    const basicCov=fr.basic_coverage||cov.basic||{};const extCov=fr.extended_coverage||cov.extended||{};
+    p2+=`<div class="ci-kw-row" style="font-weight:700;border-bottom:2px solid var(--bd)"><div>Keyword</div><div>Type</div><div>Used</div><div>Max</div><div>Status</div></div>`;
+
+    // Process coverage data if available
+    const kwEntries=[];
+    if(typeof cov==='object'){
+        Object.entries(cov).forEach(([key,val])=>{
+            if(typeof val==='object'&&val!==null&&!Array.isArray(val)){
+                Object.entries(val).forEach(([kw,st])=>{
+                    if(typeof st==='object'&&st!==null){kwEntries.push({keyword:kw,type:key,used:st.count||st.used||0,min:st.min||0,max:st.max||st.limit||'∞',status:st.status||'ok',...st})}
                 })
-        if qa_context:
-            hints["questions_users_ask"]["current_answers_preview"] = qa_context
-
-    # 3️⃣ RELATED TOPICS - z Related Searches
-    related = serp_analysis.get("related_searches", [])
-    if related:
-        hints["related_topics"] = {
-            "topics": related[:8],
-            "hint": "Powiązane frazy wyszukiwane przez użytkowników. Mogą naturalnie pojawić się w tekście jeśli są relevantne. Nie upychaj na siłę."
-        }
-
-    # 4️⃣ COMPETITOR INSIGHTS - z tytułów i snippetów
-    titles = serp_analysis.get("competitor_titles", [])
-    snippets = serp_analysis.get("competitor_snippets", [])
-    if titles or snippets:
-        hints["competitor_insights"] = {
-            "hint": "Tak konkurencja prezentuje temat w SERP. Tylko dla orientacji - Twoje podejście może być inne i lepsze."
-        }
-        if titles:
-            hints["competitor_insights"]["title_patterns"] = titles[:5]
-        if snippets:
-            hints["competitor_insights"]["description_samples"] = snippets[:3]
-
-    # 5️⃣ STRUCTURE INSPIRATION - z H2 konkurencji
-    h2_patterns = serp_analysis.get("competitor_h2_patterns", [])
-    if h2_patterns:
-        unique_h2 = list(dict.fromkeys(h2_patterns))[:10]
-        hints["structure_inspiration"] = {
-            "competitor_sections": unique_h2,
-            "hint": "Przykładowe sekcje używane przez konkurencję. Twoja struktura może być inna - to tylko kontekst co inni poruszają."
-        }
-
-    # 6️⃣ META HINT - ogólna wskazówka
-    hints["_meta"] = {
-        "interpretation": "Te wskazówki to TŁO i INSPIRACJA, nie checklist. Artykuł ma być naturalny, wartościowy i unikalny. Używaj tych danych żeby lepiej zrozumieć intencję użytkownika, nie żeby mechanicznie odpowiadać na każdy punkt.",
-        "priority": "Jakość treści > dopasowanie do SERP"
-    }
-
-    return hints
-
-# ======================================================
-# 🔍 Helper: Fetch sources from SerpAPI (FULL SERP DATA)
-# ======================================================
-def fetch_serp_sources(keyword, num_results=10):
-    """
-    Pobiera PEŁNE dane z Google przez SerpAPI:
-    - Organic results (top 10 stron) + scrapuje ich pełną treść
-    - PAA (People Also Ask)
-    - Featured Snippet
-    - Related Searches
-    - Tytuły i snippety z SERP
-    
-    ⭐ v22.3: Dodano limity rozmiaru i skip dla dużych dokumentów
-    """
-    empty_result = {
-        "sources": [],
-        "paa": [],
-        "featured_snippet": None,
-        "ai_overview": None,  # v27.0
-        "related_searches": [],
-        "serp_titles": [],
-        "serp_snippets": []
-    }
-
-    if not SERPAPI_KEY:
-        print("[S1] ⚠️ SerpAPI key not configured - cannot fetch sources")
-        return empty_result
-
-    try:
-        print(f"[S1] 🔍 Fetching FULL SERP data for: {keyword}")
-        serp_response = requests.get(
-            "https://serpapi.com/search",
-            params={
-                "q": keyword,
-                "api_key": SERPAPI_KEY,
-                "num": num_results,
-                "hl": "pl",
-                "gl": "pl"
-            },
-            timeout=30
-        )
-
-        if serp_response.status_code != 200:
-            print(f"[S1] ❌ SerpAPI error: {serp_response.status_code}")
-            return empty_result
-
-        serp_data = serp_response.json()
-
-        # ⭐ v27.0: Wyciągnij AI Overview (Google SGE)
-        ai_overview = None
-        ai_overview_data = serp_data.get("ai_overview", {})
-        if ai_overview_data:
-            ai_overview = {
-                "text": ai_overview_data.get("text", "") or ai_overview_data.get("snippet", ""),
-                "sources": [
-                    {
-                        "title": src.get("title", ""),
-                        "link": src.get("link", ""),
-                        "snippet": src.get("snippet", "")
-                    }
-                    for src in ai_overview_data.get("sources", [])[:5]
-                ],
-                "text_blocks": ai_overview_data.get("text_blocks", [])
             }
-            print(f"[S1] ✅ Found AI Overview ({len(ai_overview.get('text', ''))} chars)")
-
-        # ⭐ 2. Wyciągnij PAA (People Also Ask)
-        paa_questions = []
-        related_questions = serp_data.get("related_questions", [])
-        for q in related_questions:
-            paa_questions.append({
-                "question": q.get("question", ""),
-                "answer": q.get("snippet", ""),
-                "source": q.get("link", ""),
-                "title": q.get("title", "")
-            })
-        if paa_questions:
-            print(f"[S1] ✅ Found {len(paa_questions)} PAA questions")
-
-        # ⭐ 3. Wyciągnij Featured Snippet (Answer Box)
-        featured_snippet = None
-        answer_box = serp_data.get("answer_box", {})
-        if answer_box:
-            featured_snippet = {
-                "type": answer_box.get("type", "unknown"),
-                "title": answer_box.get("title", ""),
-                "answer": answer_box.get("answer", "") or answer_box.get("snippet", ""),
-                "source": answer_box.get("link", ""),
-                "displayed_link": answer_box.get("displayed_link", "")
-            }
-            print(f"[S1] ✅ Found Featured Snippet: {featured_snippet.get('type')}")
-
-        # ⭐ 4. Wyciągnij Related Searches
-        related_searches = []
-        for rs in serp_data.get("related_searches", []):
-            query = rs.get("query", "")
-            if query:
-                related_searches.append(query)
-        if related_searches:
-            print(f"[S1] ✅ Found {len(related_searches)} related searches")
-
-        # ⭐ 5. Wyciągnij tytuły i snippety z organic results
-        organic_results = serp_data.get("organic_results", [])
-        serp_titles = []
-        serp_snippets = []
-
-        for result in organic_results:
-            title = result.get("title", "")
-            snippet = result.get("snippet", "")
-            if title:
-                serp_titles.append(title)
-            if snippet:
-                serp_snippets.append(snippet)
-
-        if not organic_results:
-            print("[S1] ⚠️ No organic results from SerpAPI")
-            return {
-                "sources": [],
-                "paa": paa_questions,
-                "featured_snippet": featured_snippet,
-                "ai_overview": ai_overview,  # v27.0
-                "related_searches": related_searches,
-                "serp_titles": serp_titles,
-                "serp_snippets": serp_snippets
-            }
-
-        print(f"[S1] ✅ Found {len(organic_results)} SERP results")
-
-        # ⭐ 6. Scrapuj PEŁNĄ treść każdej strony + strukturę H2
-        # ⭐ v47.1: Parallel scraping with ThreadPoolExecutor
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import time as _time
-
-        def _scrape_one(item):
-            """Scrape a single URL — runs in thread pool."""
-            url = item.get("link", "")
-            title = item.get("title", "")
-            if not url:
-                return None
-            if should_skip_url(url):
-                print(f"[S1] ⏭️ Skipping large doc pattern: {url[:50]}...")
-                return None
-
-            t0 = _time.time()
-            try:
-                page_response = requests.get(
-                    url,
-                    timeout=SCRAPE_TIMEOUT,
-                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-                )
-
-                if page_response.status_code != 200:
-                    print(f"[S1] ⚠️ HTTP {page_response.status_code} from {url[:40]}")
-                    return None
-
-                raw_html = page_response.text
-
-                # Limit content size PRZED przetwarzaniem
-                if len(raw_html) > MAX_CONTENT_SIZE * 2:
-                    print(f"[S1] ⚠️ Content too large ({len(raw_html)} chars), truncating: {url[:40]}")
-                    raw_html = raw_html[:MAX_CONTENT_SIZE * 2]
-
-                # Wyciągnij H2 PRZED usunięciem tagów
-                h2_tags = re.findall(r'<h2[^>]*>(.*?)</h2>', raw_html, re.IGNORECASE | re.DOTALL)
-                h2_clean = [re.sub(r'<[^>]+>', '', h).strip() for h in h2_tags]
-                h2_clean = [h for h in h2_clean if h and len(h) < 200 and not re.search(r'[{};]|webkit|moz-|flex-|align-items', h, re.IGNORECASE)]
-
-                # Ekstrakcja treści — trafilatura lub regex fallback
-                content = None
-                if TRAFILATURA_AVAILABLE:
-                    try:
-                        content = trafilatura.extract(
-                            raw_html,
-                            include_comments=False,
-                            include_tables=True,
-                            no_fallback=False,
-                            favor_precision=True
-                        )
-                    except Exception as e:
-                        print(f"[S1] ⚠️ trafilatura failed for {url[:40]}: {e}")
-                        content = None
-
-                # Fallback: regex
-                if not content:
-                    content = raw_html
-                    content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                    content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                    content = re.sub(r'<nav[^>]*>.*?</nav>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                    content = re.sub(r'<footer[^>]*>.*?</footer>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                    content = re.sub(r'<header[^>]*>.*?</header>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                    content = re.sub(r'<[^>]+>', ' ', content)
-                    content = re.sub(r'\s+', ' ', content).strip()
-
-                content = content[:MAX_CONTENT_SIZE]
-                elapsed = _time.time() - t0
-
-                if len(content) > 500:
-                    word_count = len(content.split())
-                    print(f"[S1] ✅ Scraped {len(content)} chars ({word_count} words), {len(h2_clean)} H2 from {url[:40]} [{elapsed:.1f}s]")
-                    return {
-                        "url": url,
-                        "title": title,
-                        "content": content,
-                        "h2_structure": h2_clean[:15],
-                        "word_count": word_count
-                    }
-                else:
-                    print(f"[S1] ⚠️ Too short content from {url[:40]}")
-                    return None
-
-            except requests.exceptions.Timeout:
-                print(f"[S1] ⏱️ Timeout for {url[:40]} (>{SCRAPE_TIMEOUT}s)")
-                return None
-            except Exception as e:
-                print(f"[S1] ⚠️ Scrape error for {url[:40]}: {e}")
-                return None
-
-        # Launch all scrapes in parallel (max 6 threads)
-        scrape_targets = [r for r in organic_results[:num_results] if r.get("link")]
-        t_start = _time.time()
-        print(f"[S1] 🚀 Parallel scraping {len(scrape_targets)} pages...")
-
-        sources = []
-        total_content_size = 0
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            futures = {pool.submit(_scrape_one, item): item for item in scrape_targets}
-            for future in as_completed(futures):
-                result = future.result()
-                if result and total_content_size < MAX_TOTAL_CONTENT:
-                    sources.append(result)
-                    total_content_size += len(result["content"])
-
-        t_elapsed = _time.time() - t_start
-        print(f"[S1] ✅ Parallel scrape done: {len(sources)} sources ({total_content_size} chars) in {t_elapsed:.1f}s")
-
-
-        return {
-            "sources": sources,
-            "paa": paa_questions,
-            "featured_snippet": featured_snippet,
-            "ai_overview": ai_overview,  # v27.0
-            "related_searches": related_searches,
-            "serp_titles": serp_titles,
-            "serp_snippets": serp_snippets
-        }
-
-    except Exception as e:
-        print(f"[S1] ❌ SerpAPI fetch error: {e}")
-        return empty_result
-
-# ======================================================
-# 🔍 Endpoint: N-gram + Semantic + SERP Analysis + Firestore Save
-# ======================================================
-@app.route("/api/ngram_entity_analysis", methods=["POST"])
-def perform_ngram_analysis():
-    data = request.get_json(force=True)
-    
-    # v27.0: Akceptuj zarówno "keyword" jak i "main_keyword"
-    main_keyword = data.get("main_keyword") or data.get("keyword", "")
-    
-    sources = data.get("sources", [])
-    top_n = int(data.get("top_n", 30))
-    project_id = data.get("project_id")
-
-    # ⭐ Zmienne na dodatkowe dane SERP
-    paa_questions = []
-    featured_snippet = None
-    ai_overview = None  # v27.0: Google SGE
-    related_searches = []
-    serp_titles = []
-    serp_snippets = []
-    h2_patterns = []
-
-    # ⭐ AUTO-FETCH: Jeśli brak sources, pobierz PEŁNE dane z SerpAPI
-    if not sources:
-        if not main_keyword:
-            return jsonify({"error": "Brak main_keyword do analizy"}), 400
-
-        print(f"[S1] 🔄 No sources provided - auto-fetching FULL SERP data...")
-        serp_result = fetch_serp_sources(main_keyword, num_results=8)  # ⭐ v22.3: Reduced from 10 to 8
-
-        # Wyciągnij wszystkie dane z rezultatu
-        sources = serp_result.get("sources", [])
-        paa_questions = serp_result.get("paa", [])
-        featured_snippet = serp_result.get("featured_snippet")
-        ai_overview = serp_result.get("ai_overview")  # v27.0
-        related_searches = serp_result.get("related_searches", [])
-        serp_titles = serp_result.get("serp_titles", [])
-        serp_snippets = serp_result.get("serp_snippets", [])
-
-        if not sources:
-            return jsonify({
-                "error": "Nie udało się pobrać źródeł z SerpAPI",
-                "hint": "Sprawdź czy SERPAPI_KEY jest ustawiony i ważny",
-                "main_keyword": main_keyword,
-                "paa": paa_questions,
-                "related_searches": related_searches
-            }), 400
-
-    print(f"[S1] 🔍 Analiza n-gramów dla: {main_keyword}")
-
-    # 1️⃣ NLP Statystyczne (N-gramy)
-    ngram_presence = defaultdict(set)
-    ngram_freqs = Counter()
-    ngram_per_source = defaultdict(lambda: Counter())  # v51: per-source freq for Surfer-style ranges
-    all_text_content = []
-
-    for src_idx, src in enumerate(sources):
-        content = (src.get("content", "") or "").lower()
-        if not content.strip():
-            continue
-
-        all_text_content.append(src.get("content", ""))
-
-        # ⭐ Zbierz struktury H2 z konkurencji
-        src_h2 = src.get("h2_structure", [])
-        if src_h2:
-            h2_patterns.extend(src_h2)
-
-        # ⭐ v22.3: Limit content for NLP processing
-        doc = nlp(content[:50000])  # Reduced from 100000
-        tokens = [t.text.lower() for t in doc if t.is_alpha]
-
-        for n in range(2, 5):
-            for i in range(len(tokens) - n + 1):
-                ngram = " ".join(tokens[i:i + n])
-                ngram_freqs[ngram] += 1
-                ngram_presence[ngram].add(src.get("url", "unknown"))
-                ngram_per_source[ngram][src_idx] += 1  # v51: track per source
-
-    max_freq = max(ngram_freqs.values()) if ngram_freqs else 1
-    num_sources = len(sources)
-    results = []
-
-    for ngram, freq in ngram_freqs.items():
-        if freq < 2:
-            continue
-        freq_norm = freq / max_freq
-        site_score = len(ngram_presence[ngram]) / len(sources) if sources else 0
-        weight = round(freq_norm * 0.5 + site_score * 0.5, 4)
-        if main_keyword and main_keyword.lower() in ngram:
-            weight += 0.1
-        
-        # v51: Per-source frequency stats (Surfer-style ranges)
-        per_src = ngram_per_source.get(ngram, {})
-        # Include 0 for sources that don't have this ngram
-        all_counts = [per_src.get(i, 0) for i in range(num_sources)]
-        non_zero = sorted([c for c in all_counts if c > 0])
-        
-        if non_zero:
-            freq_min = non_zero[0]
-            freq_max = non_zero[-1]
-            mid = len(non_zero) // 2
-            freq_median = non_zero[mid] if len(non_zero) % 2 == 1 else (non_zero[mid-1] + non_zero[mid]) // 2
-        else:
-            freq_min = freq_median = freq_max = 0
-        
-        results.append({
-            "ngram": ngram,
-            "freq": freq,
-            "weight": min(1.0, weight),
-            "site_distribution": f"{len(ngram_presence[ngram])}/{len(sources)}",
-            "freq_per_source": all_counts,
-            "freq_min": freq_min,
-            "freq_median": freq_median,
-            "freq_max": freq_max
         })
+    }
+    // Also from batch instructions if no coverage data
+    if(!kwEntries.length&&batchLog.length){
+        const lastBI=batchLog[batchLog.length-1];
+        if(lastBI&&lastBI.exceeded){lastBI.exceeded.forEach(k=>kwEntries.push({keyword:k,type:'exceeded',used:'!',min:'-',max:'-',status:'exceeded'}))}
+    }
+    // From final_review missing keywords
+    if(fr.missing_keywords){fr.missing_keywords.forEach(k=>{const name=typeof k==='string'?k:(k.keyword||'');if(name)kwEntries.push({keyword:name,type:'missing',used:0,min:1,max:'∞',status:'missing'})})}
 
-    results = sorted(results, key=lambda x: x["weight"], reverse=True)[:top_n]
+    if(kwEntries.length){
+        kwEntries.slice(0,25).forEach(kw=>{
+            const st=kw.status||'ok';
+            const stClr=st==='ok'||st==='done'?G:st==='exceeded'||st==='over'?R:st==='stop'?M:st==='missing'?R:st==='near'||st==='warn'?W:G;
+            const stIcon=st==='ok'||st==='done'?'✓':st==='exceeded'?'⚠️':st==='stop'?'🛑':st==='missing'?'❌':'•';
+            p2+=`<div class="ci-kw-row"><div>${esc(kw.keyword)}</div><div style="color:${M}">${kw.type}</div><div>${kw.used}</div><div>${kw.max}</div><div style="color:${stClr};font-weight:700">${stIcon} ${st}</div></div>`;
+        });
+    }else{
+        p2+=`<div style="color:${M};padding:8px">Szczegółowe dane keywords_state dostępne z backendu — sprawdź coverage w panelu Batch Instructions</div>`;
+    }
+    // Missing + Exceeded summary
+    const missCount=fr.missing_keywords_count||0;const issCount=fr.issues_count||0;
+    if(missCount||issCount){p2+=`<div style="margin-top:8px;display:flex;gap:12px">${missCount?`<span style="color:${R};font-weight:700">❌ ${missCount} brakujących</span>`:''}${issCount?`<span style="color:${W};font-weight:700">⚠️ ${issCount} issues</span>`:''}</div>`}
 
-    # 2️⃣ Semantyka (Gemini Flash)
-    full_text_sample = " ".join(all_text_content)[:15000]
-    semantic_keyphrases = extract_semantic_tags_gemini(full_text_sample)
+    h+=ciSec('2️⃣','Keyword Control Panel',kwEntries.length?`${kwEntries.length} kw`:`${missCount} missing`,p2);
 
-    # ⭐ Unikalne H2 z konkurencji (bez duplikatów)
-    unique_h2_patterns = list(dict.fromkeys(h2_patterns))[:30]
+    // ════════════════════════════════════════════
+    // PANEL 3: ENTITY INTELLIGENCE
+    // ════════════════════════════════════════════
+    let p3='';
+    const ent=s1Data?s1Data.entity_seo||{}:{}; 
+    const compEnts=ent.top_entities||[];const mustEnts=ent.must_mention||[];
+    const compRels=ent.relations||[];const tCov=ent.topical_coverage||[];
+    const ciConceptEnts=ent.concept_entities||[];
+    const salEnts=(salienceData&&salienceData.entities)?salienceData.entities:[];
+    const ourEntNames=salEnts.map(e=>e.name.toLowerCase());
 
-    # ⭐ Przygotuj serp_analysis
-    serp_analysis_data = {
-        "paa_questions": paa_questions,
-        "featured_snippet": featured_snippet,
-        "ai_overview": ai_overview,  # v27.0: Google SGE
-        "related_searches": related_searches,
-        "competitor_titles": serp_titles[:10],
-        "competitor_snippets": serp_snippets[:10],
-        "competitor_h2_patterns": unique_h2_patterns,
-        # v27.0: Dodaj competitors z word_count dla recommended_length
-        "competitors": [
-            {
-                "url": src.get("url", ""),
-                "title": src.get("title", ""),
-                "word_count": src.get("word_count", 0),
-                "h2_count": len(src.get("h2_structure", []))
-            }
-            for src in sources
-        ]
+    // 3A: Concept Entities (topical, most valuable)
+    if(ciConceptEnts.length){
+        p3+=`<div style="font-weight:700;margin-bottom:6px;color:var(--gn)">🧠 Concept Entities (${ciConceptEnts.length})</div>`;
+        p3+=`<div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px">${ciConceptEnts.slice(0,12).map(e=>{const name=typeof e==='string'?e:(e.text||e.entity||e.name||'');const imp=typeof e==='object'?(e.importance||0):0;return`<span style="padding:2px 8px;border-radius:10px;font-size:10px;background:rgba(76,175,80,.12);border:1px solid var(--gn);color:var(--gn)">${esc(name)}${imp?` <span style="opacity:.5">${imp.toFixed(2)}</span>`:''}</span>`}).join('')}</div>`;
     }
 
-    # 3️⃣ Content Hints - WYŁĄCZONE v28.0 (duplikuje dane z serp_analysis)
-    # content_hints = generate_content_hints(serp_analysis_data, main_keyword)
+    // 3A: Entity Coverage Table
+    // v50.7 FIX 38: Check article text directly when Google NLP not available
+    const artTextLow=(liveArticle||rawArticle||'').toLowerCase();
+    // Polish-aware entity match: check stems (first 4+ chars of each word)
+    function plMatch(entityName,text){
+        if(!text||!entityName)return false;
+        const eLow=entityName.toLowerCase();
+        if(text.includes(eLow))return true;
+        // Try ó→o normalization
+        const eNorm=eLow.replace(/ó/g,'o');
+        const tNorm=text.replace(/ó/g,'o');
+        if(tNorm.includes(eNorm))return true;
+        // Stem match: all words' stems (min 4 chars) must appear close together
+        const words=eLow.split(/\s+/).filter(w=>w.length>2);
+        if(!words.length)return false;
+        const stems=words.map(w=>{const n=w.replace(/ó/g,'o');return n.length>6?n.slice(0,Math.max(4,Math.floor(n.length*0.6))):n.length>4?n.slice(0,-1):n});
+        return stems.every(s=>tNorm.includes(s));
+    }
+    const allMust=[...new Set([...mustEnts.map(e=>typeof e==='string'?e:(e.text||e.entity||'')), ...compEnts.slice(0,10).map(e=>typeof e==='string'?e:(e.text||e.entity||''))])].filter(Boolean);
+    if(allMust.length){
+        p3+=`<div style="font-weight:700;margin-bottom:6px">Entity Coverage</div>`;
+        p3+=ciGrid('1fr 45px 50px 55px 50px');
+        p3+=`<div style="font-weight:600;color:${M}">Entity</div><div style="font-weight:600;color:${M}">In S1</div><div style="font-weight:600;color:${M}">In Art.</div><div style="font-weight:600;color:${M}">Salience</div><div style="font-weight:600;color:${M}">Type</div>`;
+        let covered=0;
+        allMust.slice(0,15).forEach(name=>{
+            const nameLow=name.toLowerCase();
+            // v50.7: Check article text with Polish stemming when NLP unavailable
+            const nlpFound=ourEntNames.find(n=>n.includes(nameLow)||nameLow.includes(n));
+            const artFound=artTextLow?plMatch(name,artTextLow):false;
+            const found=nlpFound||artFound;
+            const salEnt=nlpFound?salEnts.find(e=>e.name.toLowerCase()===nlpFound):null;
+            if(found)covered++;
+            p3+=`<div>${esc(name)}</div><div style="color:${G}">✓</div><div style="color:${found?G:R};font-weight:700">${found?'✅':'❌'}</div><div>${salEnt?salEnt.salience.toFixed(3):'—'}</div><div style="font-size:9px">${salEnt?salEnt.type:'—'}</div>`;
+        });
+        p3+=`</div>`;
+        const covPct=allMust.length?Math.round(covered/allMust.length*100):0;
+        p3+=`<div style="margin:8px 0"><b style="color:${clrV(covPct,80,50)}">Pokrycie: ${covPct}%</b> (${covered}/${allMust.length})</div>`;
+    }
 
-    # 4️⃣ 🆕 Entity SEO Analysis (v28.0)
-    entity_seo_data = None
-    if ENTITY_SEO_ENABLED and sources:
-        try:
-            print(f"[S1] 🧠 Running Entity SEO analysis...")
-            entity_seo_data = perform_entity_seo_analysis(
-                nlp=nlp,
-                sources=sources,
-                main_keyword=main_keyword,
-                h2_patterns=unique_h2_patterns
-            )
-            print(f"[S1] ✅ Entity SEO: {entity_seo_data.get('entity_seo_summary', {}).get('total_entities', 0)} entities found")
-        except Exception as e:
-            print(f"[S1] ⚠️ Entity SEO error (non-critical): {e}")
-            entity_seo_data = {"error": str(e), "status": "FAILED"}
+    // 3B: Entity Salience Heatmap (bar chart)
+    if(salEnts.length){
+        p3+=`<div style="font-weight:700;margin:12px 0 6px">Entity Salience Map</div>`;
+        p3+=`<div style="display:flex;flex-wrap:wrap;gap:4px;align-items:end">`;
+        salEnts.slice(0,12).forEach(e=>{
+            const isMain=e.name.toLowerCase().includes((salienceData.main_keyword||'').toLowerCase());
+            const ht=Math.max(12,Math.round(e.salience*180));
+            const clr=isMain?P:e.has_kg?G:e.has_wikipedia?W:M;
+            p3+=`<div style="display:flex;flex-direction:column;align-items:center;width:50px"><div style="width:100%;height:${ht}px;background:${clr};border-radius:3px 3px 0 0;opacity:${isMain?1:.6}" title="${e.name}: ${e.salience}"></div><div style="font-size:7px;margin-top:2px;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;font-weight:${isMain?'800':'400'}">${esc(e.name)}</div></div>`;
+        });
+        p3+=`</div>`;
+        p3+=`<div style="margin-top:6px;font-size:9px;display:flex;gap:8px;color:${M}"><span>🟣 Główna</span><span>🟢 KG</span><span>🟡 Wikipedia</span></div>`;
+    }
 
-    # 5️⃣ 🆕 Causal Triplet Extraction (v45.0)
-    causal_data = None
-    if CAUSAL_EXTRACTOR_ENABLED and sources:
-        try:
-            print(f"[S1] 🔗 Running Causal Triplet Extraction...")
-            causal_triplets = extract_causal_triplets(
-                texts=[s.get("content", "") for s in sources],
-                main_keyword=main_keyword
-            )
-            causal_data = {
-                "count": len(causal_triplets),
-                "chains": [t.to_dict() for t in causal_triplets if t.is_chain],
-                "singles": [t.to_dict() for t in causal_triplets if not t.is_chain],
-                "agent_instruction": format_causal_for_agent(causal_triplets, main_keyword)
+    // 3C: Relation Depth
+    if(compRels.length){
+        p3+=`<div style="font-weight:700;margin:12px 0 6px">Relation Depth (S-V-O Triplets)</div>`;
+        const causal=s1Data?s1Data.causal_triplets_count||0:0;
+        p3+=`<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;text-align:center;margin-bottom:8px">`;
+        p3+=ciStat(compRels.length,'Relacji S-V-O',null);
+        p3+=ciStat(s1Data?(s1Data.causal_count_chains||0):0,'Łańcuchów',null);
+        p3+=ciStat(causal,'Total Causal',null);
+        p3+=`</div>`;
+        compRels.slice(0,6).forEach(r=>{if(typeof r==='object'){const rtype=r.type||'';p3+=`<div style="padding:2px 0;font-size:10px"><span style="color:${P}">${esc(r.from||r.subject||'?')}</span> <span style="opacity:.5">${esc(r.relation||r.verb||'→')}</span> <span style="color:${P}">${esc(r.to||r.object||'?')}</span>${rtype?` <span style="font-size:8px;opacity:.3">[${esc(rtype)}]</span>`:''}</div>`}});
+    }
+    if(tCov.length){
+        p3+=`<div style="font-weight:700;margin:12px 0 6px">Topical Coverage</div><div style="display:flex;flex-wrap:wrap;gap:3px">`;
+        tCov.slice(0,10).forEach(t=>{const topic=typeof t==='string'?t:(t.subtopic||t.topic||'');const pri=typeof t==='object'?(t.priority||''):'';const clr=pri==='MUST'?R:pri==='HIGH'?W:G;p3+=`<span style="padding:1px 6px;border-radius:10px;font-size:9px;border:1px solid ${clr};color:${clr}">${esc(topic)}</span>`});
+        p3+=`</div>`;
+    }
+    // v47.0: Backend Salience in CI Dashboard
+    const ciSal=(ent.entity_salience||[]);
+    if(ciSal.length){
+        p3+=`<div style="font-weight:700;margin:12px 0 6px;color:var(--pr)">🔬 Backend Salience (${ciSal.length})</div>`;
+        p3+=`<div style="display:flex;flex-wrap:wrap;gap:4px;align-items:end">`;
+        ciSal.slice(0,8).forEach((s,i)=>{const ht=Math.max(12,Math.round((s.salience||0)*120));const isPri=i===0;p3+=`<div style="display:flex;flex-direction:column;align-items:center;width:50px"><div style="width:100%;height:${ht}px;background:${isPri?P:G};border-radius:3px 3px 0 0;opacity:${isPri?1:.6}" title="${s.entity}: ${s.salience}"></div><div style="font-size:7px;margin-top:2px;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;font-weight:${isPri?'800':'400'}">${esc(s.entity||'')}</div></div>`});
+        p3+=`</div>`;
+        if(ciSal[0])p3+=`<div style="margin-top:6px;font-size:10px">🎯 Primary: <b style="color:var(--pr)">${esc(ciSal[0].entity||'')}</b> (${(ciSal[0].salience||0).toFixed(3)})</div>`;
+    }
+    // v47.0: Co-occurrence pairs in CI Dashboard
+    const ciCooc=(ent.entity_cooccurrence||[]);
+    if(ciCooc.length){
+        p3+=`<div style="font-weight:700;margin:12px 0 6px;color:var(--orange)">🔗 Co-occurrence (${ciCooc.length} par)</div>`;
+        ciCooc.slice(0,5).forEach(p2=>{p3+=`<div style="padding:2px 0;font-size:10px"><span style="color:${P}">${esc(p2.entity_a||'')}</span> <span style="opacity:.4">+</span> <span style="color:${P}">${esc(p2.entity_b||'')}</span> <span style="font-size:8px;opacity:.4">str:${(p2.strength||0).toFixed(2)}</span></div>`});
+    }
+    // v47.0: Placement instruction summary
+    const ciPlace=(ent.entity_placement||{});
+    if(ciPlace.first_paragraph_entities&&ciPlace.first_paragraph_entities.length){
+        p3+=`<div style="font-weight:700;margin:12px 0 6px;color:var(--gn)">📐 Placement</div>`;
+        p3+=`<div style="font-size:10px">1st paragraph: ${ciPlace.first_paragraph_entities.map(e=>`<b>${esc(e)}</b>`).join(', ')}</div>`;
+        if(ciPlace.h2_entities&&ciPlace.h2_entities.length)p3+=`<div style="font-size:10px;margin-top:3px">H2 entities: ${ciPlace.h2_entities.map(e=>`<b>${esc(e)}</b>`).join(', ')}</div>`;
+    }
+
+    h+=ciSec('3️⃣','Entity Intelligence Panel',`${ciConceptEnts.length?ciConceptEnts.length+' concept + ':''}${allMust.length} named`,p3);
+
+    // ════════════════════════════════════════════
+    // PANEL 4: E-E-A-T & DEPTH
+    // ════════════════════════════════════════════
+    let p4='';
+    // Depth Signals
+    if(s1Data&&s1Data.depth_signals){
+        const ds=s1Data.depth_signals;
+        const signals=[
+            ['🔢','Dane liczbowe',ds.numbers_used],['📅','Daty/ramy czasowe',ds.dates_used],
+            ['🏛️','Instytucje',ds.institutions_cited],['📚','Badania/źródła',ds.research_cited],
+            ['⚖️','Przepisy prawne',ds.laws_referenced],['⚠️','Wyjątki/edge cases',ds.exceptions_noted],
+            ['⚖','Porównania',ds.comparisons_made],['📋','Step-by-step',ds.step_by_step]
+        ];
+        const compPresent=signals.filter(s=>s[2]).length;
+        const avgDepth=batchLog.filter(b=>b.accepted).length?Math.round(batchLog.filter(b=>b.accepted).reduce((a,b)=>a+parseFloat(b.depth_score||0),0)/batchLog.filter(b=>b.accepted).length*10)/10:0;
+        p4+=`<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;text-align:center;margin-bottom:10px">`;
+        p4+=ciStat(`${compPresent}/8`,'Sygnałów konk.',clrV(compPresent/8*100,75,50));
+        p4+=ciStat(avgDepth,'Nasz Depth',clrV(avgDepth*20,75,50));
+        p4+=ciStat(Math.round(qb.depth||0),'Depth Score',clrV(qb.depth||0,80,60));
+        p4+=`</div>`;
+        p4+=ciGrid('24px 1fr 70px');
+        signals.forEach(([icon,label,inComp])=>{p4+=`<div>${icon}</div><div>${label}</div><div style="font-weight:700;color:${inComp?G:M}">${inComp?'✅ w konk.':'—'}</div>`});
+        p4+=`</div>`;
+        const dmi=s1Data.depth_missing_items||[];
+        if(dmi.length){p4+=`<div style="margin-top:8px"><b style="color:${W}">Luki głębokości:</b> ${dmi.slice(0,6).map(g=>`<span style="padding:1px 6px;border-radius:8px;font-size:9px;background:rgba(245,158,11,.12);color:${W};margin:2px">${typeof g==='string'?esc(g):esc(g.item||g.signal||'')}</span>`).join('')}</div>`}
+    }
+    // YMYL
+    if(s1Data&&s1Data.ymyl_hints){
+        const ym=s1Data.ymyl_hints;
+        const any=ym.legal_signals||ym.medical_signals||ym.needs_citations||ym.needs_disclaimer;
+        if(any){p4+=`<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--bd)"><b>YMYL/E-E-A-T Signals:</b> ${ym.legal_signals?'⚖️ Prawo ':''} ${ym.medical_signals?'🏥 Zdrowie ':''} ${ym.needs_citations?'📚 Cytowania ':''} ${ym.needs_disclaimer?'⚠️ Disclaimer':''}</div>`}
+    }
+    h+=ciSec('4️⃣','E-E-A-T & Depth Analysis',`${s1Data?(s1Data.depth_signals?Object.values(s1Data.depth_signals).filter(Boolean).length:0):0}/8`,p4);
+
+
+    // ════════════════════════════════════════════
+    // PANEL 5: YMYL INTELLIGENCE
+    // ════════════════════════════════════════════
+    let p5y='';
+    const ymCtx=ymylCtxData||{};const ymAn=ymylAnalysisData||{};const ymVal=ymylValData||{};
+    const ymLegal=ymCtx.is_legal;const ymMedical=ymCtx.is_medical;
+
+    if(ymLegal||ymMedical){
+        const anL=ymAn.legal||{};const anM=ymAn.medical||{};
+
+        // ── PODSUMOWANIE ──
+        const totalRefs=(anL.acts_found||[]).length+(anL.judgments_found||[]).length+(anM.pmids_found||[]).length+(anM.studies_referenced||[]).length;
+        const anyDiscl=(anL.disclaimer_present)||(anM.disclaimer_present);
+        p5y+=`<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;text-align:center;margin-bottom:16px">`;
+        p5y+=ciStat(ymLegal?`${anL.score||0}/100`:'—','Ocena prawna',ymLegal?clrV(anL.score||0,70,40):M);
+        p5y+=ciStat(ymMedical?`${anM.score||0}/100`:'—','Ocena medyczna',ymMedical?clrV(anM.score||0,70,40):M);
+        p5y+=ciStat(totalRefs,'Źródeł w tekście',totalRefs>5?G:totalRefs>0?W:R);
+        p5y+=ciStat(anyDiscl?'✅':'❌','Zastrzeżenie',anyDiscl?G:R);
+        p5y+=`</div>`;
+
+        // ═══════════════════════════════
+        // ── SEKCJA PRAWNA ──
+        // ═══════════════════════════════
+        if(ymLegal){
+            const lCtx=ymCtx.legal||{};
+            p5y+=`<div style="padding:14px;background:var(--bg2);border-radius:10px;margin-bottom:12px;border-left:3px solid #fba92c">`;
+            p5y+=`<div style="font-size:15px;font-weight:700;margin-bottom:12px">⚖️ Kontekst prawny</div>`;
+
+            // --- Orzeczenia podane do AI ---
+            const ctxJ=lCtx.judgments||[];
+            if(ctxJ.length){
+                p5y+=`<div style="font-size:12px;font-weight:600;color:${M};margin-bottom:6px">📋 Orzeczenia podane do AI (${ctxJ.length})</div>`;
+                p5y+=`<div style="display:grid;gap:6px;margin-bottom:12px">`;
+                ctxJ.slice(0,6).forEach(j=>{
+                    p5y+=`<div style="padding:8px 10px;background:var(--s2);border-radius:8px;border-left:2px solid ${P}">`;
+                    p5y+=`<div style="font-size:13px;font-weight:700;color:${P}">${esc(j.signature||'brak sygnatury')}</div>`;
+                    p5y+=`<div style="font-size:12px;color:${M};margin-top:2px">${esc(j.court||'')}${j.date?' · '+esc(j.date):''}</div>`;
+                    if(j.summary)p5y+=`<div style="font-size:11px;color:${M};margin-top:3px;opacity:.8">${esc(j.summary)}</div>`;
+                    p5y+=`</div>`;
+                });
+                p5y+=`</div>`;
             }
-            print(f"[S1] ✅ Causal Triplets: {len(causal_triplets)} found "
-                  f"({sum(1 for t in causal_triplets if t.is_chain)} chains)")
-        except Exception as e:
-            print(f"[S1] ⚠️ Causal extraction error (non-critical): {e}")
-            causal_data = {"error": str(e), "status": "FAILED"}
 
-    # 6️⃣ 🆕 Content Gap Analysis (v45.0)
-    content_gaps_data = None
-    if GAP_ANALYZER_ENABLED and sources:
-        try:
-            print(f"[S1] 📊 Running Gap Analysis...")
-            content_gaps_data = analyze_content_gaps(
-                competitor_texts=[s.get("content", "") for s in sources],
-                competitor_h2s=unique_h2_patterns,
-                paa_questions=paa_questions,
-                related_searches=related_searches,
-                main_keyword=main_keyword
-            )
-            print(f"[S1] ✅ Content Gaps: {content_gaps_data.get('total_gaps', 0)} gaps found")
-        except Exception as e:
-            print(f"[S1] ⚠️ Gap Analysis error (non-critical): {e}")
-            content_gaps_data = {"error": str(e), "status": "FAILED"}
+            // --- Akty prawne podane do AI ---
+            const ctxA=lCtx.legal_acts||[];
+            if(ctxA.length){
+                p5y+=`<div style="font-size:12px;font-weight:600;color:${M};margin-bottom:6px">📜 Akty prawne podane do AI (${ctxA.length})</div>`;
+                p5y+=`<div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:12px">`;
+                ctxA.slice(0,8).forEach(a=>{const name=typeof a==='string'?a:(a.name||'');p5y+=`<span style="padding:4px 10px;border-radius:8px;font-size:12px;border:1px solid ${W};color:${W}">${esc(name)}</span>`});
+                p5y+=`</div>`;
+            }
 
-    # ⭐ PEŁNA ODPOWIEDŹ z wszystkimi danymi SERP
-    response_payload = {
-        "main_keyword": main_keyword,
-        "ngrams": results,
-        "semantic_keyphrases": semantic_keyphrases,
+            // --- Co faktycznie trafiło do tekstu ---
+            p5y+=`<div style="font-size:13px;font-weight:700;margin:14px 0 8px;padding-top:10px;border-top:1px solid var(--bd)">🔍 Co znaleziono w artykule</div>`;
 
-        # ✅ NOWE (MINIMALNA ZMIANA): zwracamy próbkę pełnych treści konkurencji,
-        # aby Master API mogło liczyć semantic coverage na realnym korpusie.
-        # Zachowujemy kompatybilność wsteczną przez alias "serp_content".
-        "full_text_sample": full_text_sample,
-        "serp_content": full_text_sample,
+            if(anL.acts_found&&anL.acts_found.length){
+                p5y+=`<div style="margin-bottom:10px"><div style="font-size:12px;font-weight:600;color:${G};margin-bottom:5px">✅ Akty prawne w tekście (${anL.acts_found.length})</div>`;
+                p5y+=`<div style="display:flex;flex-wrap:wrap;gap:5px">`;
+                anL.acts_found.slice(0,10).forEach(a=>{p5y+=`<span style="padding:4px 10px;border-radius:8px;font-size:12px;background:rgba(34,197,94,.1);color:${G};font-weight:500">${esc(a)}</span>`});
+                p5y+=`</div></div>`;
+            }else{
+                p5y+=`<div style="font-size:12px;color:${R};margin-bottom:8px">❌ Brak aktów prawnych w tekście</div>`;
+            }
 
-        # ⭐ Pełna analiza SERP (surowe dane)
-        "serp_analysis": serp_analysis_data,
+            if(anL.judgments_found&&anL.judgments_found.length){
+                p5y+=`<div style="margin-bottom:10px"><div style="font-size:12px;font-weight:600;color:${G};margin-bottom:5px">✅ Sygnatury orzeczeń w tekście (${anL.judgments_found.length})</div>`;
+                anL.judgments_found.slice(0,8).forEach(j=>{p5y+=`<div style="padding:3px 0;font-size:13px;color:${P};font-weight:600">${esc(j)}</div>`});
+                p5y+=`</div>`;
+            }else{
+                p5y+=`<div style="font-size:12px;color:${R};margin-bottom:8px">❌ Brak sygnatur orzeczeń w tekście</div>`;
+            }
 
-        # ⭐ Content Hints - WYŁĄCZONE v28.0 (BRAJEN używa serp_analysis bezpośrednio)
-        # "content_hints": content_hints,
+            if(anL.articles_cited&&anL.articles_cited.length){
+                p5y+=`<div style="margin-bottom:10px"><div style="font-size:12px;font-weight:600;color:${M};margin-bottom:5px">§ Cytowane przepisy (${anL.articles_cited.length})</div>`;
+                p5y+=`<div style="display:flex;flex-wrap:wrap;gap:5px">`;
+                anL.articles_cited.slice(0,15).forEach(a=>{p5y+=`<span style="padding:3px 8px;border-radius:6px;font-size:12px;background:var(--bd)">${esc(a)}</span>`});
+                p5y+=`</div></div>`;
+            }
 
-        # 🆕 Entity SEO (v28.0)
-        "entity_seo": entity_seo_data,
+            // Podsumowanie wykorzystania
+            p5y+=`<div style="margin-top:10px;padding:8px 12px;background:var(--s2);border-radius:8px;display:flex;justify-content:space-between;align-items:center;font-size:12px">`;
+            p5y+=`<span style="color:${M}">Wykorzystano z bazy: <b>${anL.acts_from_context_used||0}</b> aktów, <b>${anL.judgments_from_context_used||0}</b> orzeczeń</span>`;
+            p5y+=`<span style="color:${anL.disclaimer_present?G:R};font-weight:700;font-size:13px">${anL.disclaimer_present?'✅ Zastrzeżenie prawne dodane':'❌ Brak zastrzeżenia prawnego!'}</span>`;
+            p5y+=`</div>`;
 
-        # 🆕 Causal Triplets (v45.0)
-        "causal_triplets": causal_data,
+            p5y+=`</div>`; // end legal section
+        }
 
-        # 🆕 Content Gaps (v45.0)
-        "content_gaps": content_gaps_data,
+        // ═══════════════════════════════
+        // ── SEKCJA MEDYCZNA ──
+        // ═══════════════════════════════
+        if(ymMedical){
+            const mCtx=ymCtx.medical||{};
+            p5y+=`<div style="padding:14px;background:var(--bg2);border-radius:10px;margin-bottom:12px;border-left:3px solid #9e9e9e">`;
+            p5y+=`<div style="font-size:15px;font-weight:700;margin-bottom:12px">🏥 Kontekst medyczny</div>`;
 
-        "summary": {
-            "total_sources": len(sources),
-            "sources_auto_fetched": not bool(data.get("sources", [])),
-            "paa_count": len(paa_questions),
-            "has_featured_snippet": featured_snippet is not None,
-            "has_ai_overview": ai_overview is not None,
-            "related_searches_count": len(related_searches),
-            "h2_patterns_found": len(unique_h2_patterns),
-            "entity_seo_enabled": ENTITY_SEO_ENABLED,
-            "entities_found": entity_seo_data.get("entity_seo_summary", {}).get("total_entities", 0) if entity_seo_data else 0,
-            "causal_triplets_found": causal_data.get("count", 0) if causal_data else 0,
-            "content_gaps_found": content_gaps_data.get("total_gaps", 0) if content_gaps_data else 0,
-            "engine": "v28.0",
-            "lsi_candidates": len(semantic_keyphrases),
+            // --- Publikacje podane do AI ---
+            const ctxP=mCtx.publications||[];
+            if(ctxP.length){
+                p5y+=`<div style="font-size:12px;font-weight:600;color:${M};margin-bottom:6px">📚 Publikacje podane do AI (${ctxP.length})</div>`;
+                p5y+=`<div style="display:grid;gap:6px;margin-bottom:12px">`;
+                ctxP.slice(0,6).forEach(p=>{
+                    p5y+=`<div style="padding:8px 10px;background:var(--s2);border-radius:8px;border-left:2px solid #fba92c">`;
+                    p5y+=`<div style="font-size:13px;font-weight:600;color:var(--fg)">"${esc(p.title||'brak tytułu')}"</div>`;
+                    p5y+=`<div style="font-size:12px;color:${P};margin-top:3px">${esc(p.authors||'')} (${esc(p.year||'')})</div>`;
+                    const tags=[];
+                    if(p.pmid)tags.push(`<span style="padding:2px 8px;border-radius:6px;font-size:11px;background:rgba(251,169,44,.15);color:#fba92c;font-weight:600">PMID: ${p.pmid}</span>`);
+                    if(p.journal)tags.push(`<span style="font-size:11px;color:${M}">${esc(p.journal)}</span>`);
+                    if(p.evidence_level)tags.push(`<span style="padding:2px 8px;border-radius:6px;font-size:11px;background:rgba(34,197,94,.15);color:${G};font-weight:600">Poziom: ${esc(p.evidence_level)}</span>`);
+                    if(p.study_type)tags.push(`<span style="padding:2px 8px;border-radius:6px;font-size:11px;background:rgba(245,158,11,.15);color:${W}">${esc(p.study_type)}</span>`);
+                    if(tags.length)p5y+=`<div style="margin-top:4px;display:flex;gap:6px;flex-wrap:wrap">${tags.join('')}</div>`;
+                    p5y+=`</div>`;
+                });
+                p5y+=`</div>`;
+            }
+
+            // --- Poziomy dowodów z kontekstu ---
+            const evLvls=mCtx.evidence_levels||{};
+            if(Object.keys(evLvls).length){
+                const lvlNames={'Ia':'Meta-analizy','Ib':'Badania randomizowane (RCT)','IIa':'Badania kohortowe','IIb':'Badania case-control','III':'Serie przypadków','IV':'Opinie ekspertów'};
+                p5y+=`<div style="margin-bottom:12px"><div style="font-size:12px;font-weight:600;color:${M};margin-bottom:6px">📊 Poziomy wiarygodności dowodów</div>`;
+                p5y+=`<div style="display:flex;gap:8px;flex-wrap:wrap">`;
+                Object.entries(evLvls).forEach(([lvl,count])=>{
+                    const clr=lvl.startsWith('I')?G:lvl.startsWith('II')?W:M;
+                    const name=lvlNames[lvl]||lvl;
+                    p5y+=`<span style="padding:5px 12px;border-radius:10px;font-size:12px;border:1.5px solid ${clr};color:${clr};font-weight:600">${name}: ${count}</span>`;
+                });
+                p5y+=`</div></div>`;
+            }
+
+            // --- Co faktycznie trafiło do tekstu ---
+            p5y+=`<div style="font-size:13px;font-weight:700;margin:14px 0 8px;padding-top:10px;border-top:1px solid var(--bd)">🔍 Co znaleziono w artykule</div>`;
+
+            if(anM.pmids_found&&anM.pmids_found.length){
+                p5y+=`<div style="margin-bottom:10px"><div style="font-size:12px;font-weight:600;color:${G};margin-bottom:5px">✅ Identyfikatory PMID w tekście (${anM.pmids_found.length})</div>`;
+                p5y+=`<div style="display:flex;flex-wrap:wrap;gap:5px">`;
+                anM.pmids_found.slice(0,10).forEach(id=>{p5y+=`<span style="padding:4px 10px;border-radius:8px;font-size:12px;background:rgba(251,169,44,.1);color:#fba92c;font-weight:600">PMID: ${esc(id)}</span>`});
+                p5y+=`</div></div>`;
+            }else{
+                p5y+=`<div style="font-size:12px;color:${R};margin-bottom:8px">❌ Brak identyfikatorów PMID w tekście</div>`;
+            }
+
+            if(anM.studies_referenced&&anM.studies_referenced.length){
+                p5y+=`<div style="margin-bottom:10px"><div style="font-size:12px;font-weight:600;color:${G};margin-bottom:5px">✅ Odwołania do badań (${anM.studies_referenced.length})</div>`;
+                anM.studies_referenced.slice(0,6).forEach(s=>{p5y+=`<div style="padding:3px 0;font-size:12px;color:var(--fg)">· ${esc(s)}</div>`});
+                p5y+=`</div>`;
+            }else{
+                p5y+=`<div style="font-size:12px;color:${R};margin-bottom:8px">❌ Brak odwołań do badań naukowych</div>`;
+            }
+
+            if(anM.institutions_found&&anM.institutions_found.length){
+                p5y+=`<div style="margin-bottom:10px"><div style="font-size:12px;font-weight:600;color:${M};margin-bottom:5px">🏛️ Instytucje wymienione w tekście (${anM.institutions_found.length})</div>`;
+                p5y+=`<div style="display:flex;flex-wrap:wrap;gap:5px">`;
+                anM.institutions_found.forEach(i=>{p5y+=`<span style="padding:3px 10px;border-radius:6px;font-size:12px;background:var(--bd)">${esc(i)}</span>`});
+                p5y+=`</div></div>`;
+            }
+
+            // --- Poziomy dowodów w tekście ---
+            const evIn=anM.evidence_indicators||{};
+            if(Object.keys(evIn).length){
+                const lvlNames={'Ia':'Meta-analizy','Ib':'Badania RCT','IIa':'Kohortowe','IIb':'Case-control','III':'Serie przypadków','IV':'Opinie ekspertów'};
+                p5y+=`<div style="margin-bottom:10px"><div style="font-size:12px;font-weight:600;color:${M};margin-bottom:5px">📊 Poziomy dowodów wykryte w tekście</div>`;
+                p5y+=`<div style="display:flex;gap:8px;flex-wrap:wrap">`;
+                Object.entries(evIn).forEach(([lvl,count])=>{
+                    const clr=lvl.startsWith('I')?G:lvl.startsWith('II')?W:M;
+                    const name=lvlNames[lvl]||lvl;
+                    p5y+=`<span style="padding:5px 12px;border-radius:10px;font-size:12px;border:1.5px solid ${clr};color:${clr};font-weight:600">${name}: ${count}×</span>`;
+                });
+                p5y+=`</div></div>`;
+            }
+
+            // Podsumowanie wykorzystania
+            p5y+=`<div style="margin-top:10px;padding:8px 12px;background:var(--s2);border-radius:8px;display:flex;justify-content:space-between;align-items:center;font-size:12px">`;
+            p5y+=`<span style="color:${M}">Wykorzystano z bazy: <b>${anM.pubs_from_context_used||0}</b> publikacji</span>`;
+            p5y+=`<span style="color:${anM.disclaimer_present?G:R};font-weight:700;font-size:13px">${anM.disclaimer_present?'✅ Zastrzeżenie medyczne dodane':'❌ Brak zastrzeżenia medycznego!'}</span>`;
+            p5y+=`</div>`;
+
+            p5y+=`</div>`; // end medical section
+        }
+    }else{
+        p5y+=`<div style="color:${M};font-size:13px;font-style:italic;padding:8px">Temat nie jest YMYL (prawny/medyczny) — panel nieaktywny</div>`;
+    }
+
+    const ymylBadge=ymLegal&&ymMedical?'⚖️🏥':ymLegal?'⚖️ Prawo':ymMedical?'🏥 Medycyna':'—';
+    h+=ciSec('5️⃣','Wiarygodność YMYL',ymylBadge,p5y);
+
+    // ════════════════════════════════════════════
+    // PANEL 6: ANTI-FRANKENSTEIN
+    // ════════════════════════════════════════════
+    let p5='';
+    // 5A: Style Drift
+    if(styleData){
+        const metrics=[
+            ['CV Zdań',styleData.cv_sentences,'0.25–0.50',(v)=>v>=0.25&&v<=0.5?G:v>0.6?R:W],
+            ['Passive Voice',styleData.passive_ratio,'< 20%',(v)=>v<=0.2?G:v<=0.3?W:R],
+            ['Transitions',styleData.transition_ratio,'10–35%',(v)=>v>=0.1&&v<=0.35?G:W],
+            ['Repetition',styleData.repetition_ratio,'< 8%',(v)=>v<0.08?G:v<0.15?W:R],
+            ['CV Akapitów',styleData.cv_paragraphs,'< 0.50',(v)=>v<0.5?G:v<0.7?W:R],
+        ];
+        p5+=`<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;text-align:center;margin-bottom:10px">`;
+        p5+=ciStat(`${styleData.score}/100`,'Style Score',clrV(styleData.score,75,50));
+        p5+=ciStat(styleData.sentence_count,'Zdań',null);
+        p5+=ciStat(`${styleData.avg_sentence_length}`,'Śr. długość',null);
+        p5+=ciStat(styleData.paragraph_count,'Akapitów',null);
+        p5+=`</div>`;
+        p5+=ciGrid('90px 1fr 45px 80px');
+        p5+=`<div style="font-weight:600;color:${M}">Metric</div><div style="font-weight:600;color:${M}">Bar</div><div style="font-weight:600;color:${M}">Value</div><div style="font-weight:600;color:${M}">Target</div>`;
+        metrics.forEach(([label,val,target,clrFn])=>{if(val==null)return;const clr=clrFn(val);p5+=`<div>${label}</div>${ciBar(Math.min(100,val*100),clr)}<div style="text-align:right;font-weight:700;color:${clr}">${val<1?val.toFixed(2):val.toFixed(0)}</div><div style="font-size:9px;color:${M}">${target}</div>`});
+        p5+=`</div>`;
+        if(styleData.issues&&styleData.issues.length){p5+=`<div style="margin-top:8px">${styleData.issues.map(i=>`<div style="color:${W};margin-top:2px;font-size:10px">⚠️ ${esc(i)}</div>`).join('')}</div>`}
+    }
+    // 5B: Article Memory
+    if(memoryData){
+        p5+=`<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--bd)"><div style="font-weight:700;margin-bottom:6px">🧠 Article Memory</div>`;
+        if(memoryData.thesis)p5+=`<div style="margin:4px 0"><b>Teza:</b> ${esc(memoryData.thesis)}</div>`;
+        if(memoryData.tone)p5+=`<div style="margin:4px 0"><b>Ton:</b> ${esc(memoryData.tone)}</div>`;
+        if(memoryData.open_threads&&memoryData.open_threads.length)p5+=`<div style="margin:4px 0"><b style="color:${W}">Open threads (${memoryData.open_threads.length}):</b> ${memoryData.open_threads.map(t=>`<span style="padding:1px 6px;border-radius:8px;font-size:9px;background:rgba(245,158,11,.12);color:${W};margin:2px">${esc(typeof t==='string'?t:t.thread||t.topic||'')}</span>`).join('')}</div>`;
+        if(memoryData.entities_introduced&&memoryData.entities_introduced.length)p5+=`<div style="margin:4px 0"><b>Entities introduced:</b> ${memoryData.entities_introduced.slice(0,10).map(e=>`<span style="padding:1px 6px;border-radius:8px;font-size:9px;border:1px solid ${G};color:${G};margin:2px">${esc(typeof e==='string'?e:e.name||e.entity||'')}</span>`).join('')}</div>`;
+        if(memoryData.defined_terms&&memoryData.defined_terms.length)p5+=`<div style="margin:4px 0"><b>Defined terms:</b> ${memoryData.defined_terms.slice(0,10).map(t=>`<span style="padding:1px 5px;border-radius:8px;font-size:9px;border:1px solid ${P};color:${P};margin:2px">${esc(typeof t==='string'?t:t.term||'')}</span>`).join('')}</div>`;
+        if(memoryData.topics_covered&&memoryData.topics_covered.length)p5+=`<div style="margin:4px 0"><b>Topics covered (${memoryData.topics_covered.length}):</b> ${memoryData.topics_covered.slice(0,12).map(t=>`<span style="padding:1px 5px;border-radius:8px;font-size:9px;background:var(--bd);margin:2px">${esc(typeof t==='string'?t:t.topic||t.h2||'')}</span>`).join('')}</div>`;
+        p5+=`</div>`;
+    }
+    h+=ciSec('6️⃣','Anti-Frankenstein & Memory',styleData?`${styleData.score}/100`:'—',p5);
+
+    // ════════════════════════════════════════════
+    // PANEL 7: PAA & SNIPPET OPTIMIZATION
+    // ════════════════════════════════════════════
+    let p6paa='';
+    const s1paa=s1Data?s1Data.paa_questions||[]:[];
+    const paaUn=s1Data?s1Data.paa_unanswered||[]:[];
+    const schData=document.getElementById('schB')?document.getElementById('schB').textContent:'';
+    const hasFaqSchema=schData.includes('FAQPage');
+
+    p6paa+=`<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;text-align:center;margin-bottom:10px">`;
+    p6paa+=ciStat(s1paa.length,'PAA z SERP',null);
+    p6paa+=ciStat(paaData?paaData.questions_generated:0,'FAQ wygenerowane',paaData&&paaData.questions_generated>0?G:M);
+    p6paa+=ciStat(paaUn.length,'Bez odpowiedzi',paaUn.length?R:G);
+    p6paa+=ciStat(hasFaqSchema?'✅':'—','FAQ Schema',hasFaqSchema?G:M);
+    p6paa+=`</div>`;
+
+    // PAA questions list with coverage status
+    if(s1paa.length){
+        p6paa+=`<div style="font-weight:700;margin-bottom:4px">Pytania PAA z SERP</div>`;
+        s1paa.slice(0,10).forEach(q=>{
+            const txt=typeof q==='string'?q:(q.question||q.text||JSON.stringify(q));
+            const isUnanswered=paaUn.some(u=>{const ut=typeof u==='string'?u:(u.question||u.text||'');return ut.toLowerCase()===txt.toLowerCase()});
+            p6paa+=`<div style="padding:2px 0;font-size:10px"><span style="color:${isUnanswered?R:G};font-weight:700">${isUnanswered?'✗':'✓'}</span> ${esc(txt)}</div>`;
+        });
+        const coveredPct=s1paa.length?Math.round((s1paa.length-paaUn.length)/s1paa.length*100):0;
+        p6paa+=`<div style="margin-top:6px"><b style="color:${clrV(coveredPct,80,50)}">Pokrycie PAA: ${coveredPct}%</b></div>`;
+    }
+
+    // Semantic gaps
+    const sGaps=s1Data?s1Data.subtopic_missing||(s1Data.content_gaps||{}).subtopic_missing||[]:[];
+    if(sGaps.length){
+        p6paa+=`<div style="margin-top:8px"><b style="color:${W}">Semantic Gaps (${sGaps.length}):</b><div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:4px">${sGaps.slice(0,8).map(g=>`<span style="padding:1px 6px;border-radius:8px;font-size:9px;background:rgba(245,158,11,.1);color:${W}">${typeof g==='string'?esc(g):esc(g.subtopic||g.topic||'')}</span>`).join('')}</div></div>`;
+    }
+
+    h+=ciSec('7️⃣','PAA & Snippet Optimization',`${s1paa.length} PAA`,p6paa);
+
+    // ════════════════════════════════════════════
+    // PANEL 8: COMPETITIVE ENTITY GAP
+    // ════════════════════════════════════════════
+    let p6='';
+    // Competitor comparison
+    const ourEntCount=salEnts.length||allMust.filter(n=>plMatch(n,artTextLow)).length;const compEntCount=compEnts.length+mustEnts.length;
+    const ourTriplets=compRels.length;
+    const ourBatchDepthAvg=batchLog.filter(b=>b.accepted).length?Math.round(batchLog.filter(b=>b.accepted).reduce((a,b)=>a+parseFloat(b.depth_score||0),0)/batchLog.filter(b=>b.accepted).length*10)/10:0;
+
+    p6+=`<div style="font-weight:700;margin-bottom:8px">Your Article vs Competitors (avg top 5)</div>`;
+    p6+=ciGrid('1fr 80px 80px');
+    p6+=`<div style="font-weight:600;color:${M}">Metric</div><div style="font-weight:600;color:${M}">Competitors</div><div style="font-weight:600;color:${M}">Your Article</div>`;
+    const compData=[
+        ['Entities',compEntCount,ourEntCount],
+        ['Triplets/Relations',compRels.length,compRels.length],
+        ['Depth Signals',s1Data?(Object.values(s1Data.depth_signals||{}).filter(Boolean).length):0,'—'],
+        ['Word Count',s1Data?s1Data.average_length||'?':'?',wordCount],
+    ];
+    compData.forEach(([m,comp,ours])=>{
+        const better=typeof ours==='number'&&typeof comp==='number'?ours>=comp:false;
+        p6+=`<div>${m}</div><div style="text-align:center">${comp}</div><div style="text-align:center;font-weight:700;color:${better?G:typeof ours==='number'?R:M}">${ours}${better?' ✓':''}</div>`;
+    });
+    p6+=`</div>`;
+
+    // Content Gaps — unique advantages
+    const gaps=s1Data?s1Data.content_gaps||{}:{};
+    const pU=s1Data?(s1Data.paa_unanswered||gaps.paa_unanswered||[]):[];
+    const sM=s1Data?(s1Data.subtopic_missing||gaps.subtopic_missing||[]):[];
+    const sh2=s1Data?s1Data.suggested_h2s||[]:[];
+    if(pU.length||sh2.length){
+        p6+=`<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--bd)"><b>🎯 Information Gain (przewagi)</b></div>`;
+        if(pU.length){p6+=`<div style="margin:4px 0"><span style="color:${R};font-weight:700">PAA bez odpowiedzi (${pU.length}):</span><div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:4px">${pU.slice(0,5).map(g=>`<span style="padding:1px 6px;border-radius:8px;font-size:9px;background:rgba(239,68,68,.08);color:${R}">${typeof g==='string'?esc(g):esc(g.question||'')}</span>`).join('')}</div></div>`}
+        if(sh2.length){p6+=`<div style="margin:4px 0"><span style="color:${G};font-weight:700">Unikalne sekcje:</span><div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:4px">${sh2.slice(0,5).map(x=>`<span style="padding:1px 6px;border-radius:8px;font-size:9px;background:rgba(34,197,94,.08);color:${G}">${typeof x==='string'?esc(x):esc(x.h2||x.heading||'')}</span>`).join('')}</div></div>`}
+    }
+
+    // Subject Position
+    const sp=salienceData&&salienceData.subject_position;
+    if(sp&&sp.total_sentences>0){
+        p6+=`<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--bd)"><b>📐 Subject Position</b></div>`;
+        const totalPos=sp.subject_position+sp.middle_position+sp.object_position;
+        if(totalPos>0){
+            p6+=`<div style="display:flex;height:16px;border-radius:8px;overflow:hidden;margin:6px 0">`;
+            [[sp.subject_position,G,'Podmiot'],[sp.middle_position,W,'Środek'],[sp.object_position,R,'Dopełn.']].forEach(([val,clr,label])=>{const pct=val/totalPos*100;if(pct>0)p6+=`<div style="width:${pct}%;background:${clr};display:flex;align-items:center;justify-content:center;font-size:8px;color:white;font-weight:700" title="${label}: ${val}">${pct>12?Math.round(pct)+'%':''}</div>`});
+            p6+=`</div><div style="display:flex;justify-content:space-between;font-size:9px;color:${M}"><span>Podmiot: ${sp.subject_position}</span><span>Środek: ${sp.middle_position}</span><span>Dopełn.: ${sp.object_position}</span></div>`;
         }
     }
 
-    # 3️⃣ Firestore Save (optional)
-    if project_id:
-        try:
-            db = firestore.client()
-            doc_ref = db.collection("seo_projects").document(project_id)
-            if doc_ref.get().exists:
-                avg_len = (
-                    sum(len(t.split()) for t in all_text_content) // len(all_text_content)
-                    if all_text_content else 0
-                )
-                doc_ref.update({
-                    "s1_data": response_payload,
-                    "lsi_enrichment": {"enabled": True, "count": len(semantic_keyphrases)},
-                    "avg_competitor_length": avg_len,
-                    "updated_at": firestore.SERVER_TIMESTAMP
-                })
-                response_payload["saved_to_firestore"] = True
-                print(f"[S1] ✅ Wyniki n-gramów zapisane do Firestore → {project_id}")
-            else:
-                response_payload["saved_to_firestore"] = False
-                print(f"[S1] ⚠️ Nie znaleziono projektu {project_id}")
-        except Exception as e:
-            print(f"[S1] ❌ Firestore error: {e}")
-            response_payload["firestore_error"] = str(e)
+    h+=ciSec('8️⃣','Competitive Entity Gap',`${allMust.length?Math.round((allMust.filter(n=>{const nl=n.toLowerCase();return ourEntNames.find(o=>o.includes(nl)||nl.includes(o))||plMatch(n,artTextLow)}).length/allMust.length)*100):0}% cov.`,p6);
 
-    return jsonify(response_payload)
+    // ════════════════════════════════════════════
+    // PANEL 9: BATCH QUALITY + WORKFLOW TIMELINE
+    // ════════════════════════════════════════════
+    let p7='';
+    // 7A: Batch Quality Timeline
+    if(batchLog.length){
+        p7+=`<div style="font-weight:700;margin-bottom:8px">Batch Quality Timeline</div>`;
+        p7+=`<div style="display:flex;align-items:end;gap:3px;height:50px">`;
+        batchLog.forEach(b=>{const q=b.quality_score||0;const ht=Math.max(4,Math.round(q/100*46));const clr=b.accepted?(q>=80?G:q>=60?W:'#9e9e9e'):R;p7+=`<div style="flex:1;display:flex;flex-direction:column;align-items:center"><div style="width:100%;height:${ht}px;background:${clr};border-radius:3px 3px 0 0;min-width:16px" title="B${b.batch}: ${q}/100"></div><div style="font-size:7px;color:${M}">${b.batch}</div></div>`});
+        p7+=`</div>`;
+        const accepted=batchLog.filter(b=>b.accepted);
+        const avgQ=accepted.length?Math.round(accepted.reduce((a,b)=>a+(b.quality_score||0),0)/accepted.length):0;
+        const totalW=accepted.reduce((a,b)=>a+(b.word_count||0),0);
+        const exceeded=[...new Set(batchLog.reduce((a,b)=>a.concat(b.exceeded||[]),[]))];
+        p7+=`<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:6px;text-align:center">`;
+        p7+=ciStat(avgQ,'Avg Quality',clrV(avgQ,75,50));
+        p7+=ciStat(accepted.length+'/'+batchLog.length,'Accepted',null);
+        p7+=ciStat(totalW,'Words',null);
+        p7+=ciStat(exceeded.length,'Exceeded',exceeded.length?R:G);
+        p7+=`</div>`;
+        if(exceeded.length){p7+=`<div style="margin-top:4px">${exceeded.map(k=>`<span style="padding:1px 5px;border-radius:8px;font-size:9px;background:rgba(239,68,68,.1);color:${R};margin:2px">${esc(k)}</span>`).join('')}</div>`}
+    }
 
-# ======================================================
-# 🧩 Pozostałe Endpointy (Proxy)
-# ======================================================
-@app.route("/api/synthesize_topics", methods=["POST"])
-def perform_synthesize_topics():
-    data = request.get_json(force=True)
-    ngrams = data.get("ngrams", [])
+    // 7B: Workflow Timeline
+    if(stepTimingData){
+        p7+=`<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--bd)"><div style="font-weight:700;margin-bottom:6px">⏱️ Workflow Timeline <span style="font-size:10px;color:${M}">${Math.round(stepTimingData.total_seconds||0)}s total</span></div>`;
+        const stepNames=['S1 Analysis','YMYL','H2 Plan','Create Project','Phrase Hierarchy','Batch Loop','PAA / FAQ','Final Review','Editorial','Export'];
+        const steps=stepTimingData.steps||{};
+        p7+=ciGrid('24px 1fr 50px 1fr');
+        p7+=`<div style="font-weight:600;color:${M}">#</div><div style="font-weight:600;color:${M}">Step</div><div style="font-weight:600;color:${M}">Time</div><div></div>`;
+        const maxTime=Math.max(...Object.values(steps).map(Number),1);
+        stepNames.forEach((name,i)=>{
+            const t=steps[String(i+1)]||0;
+            const pct=t/maxTime*100;
+            p7+=`<div style="color:${M}">${i+1}</div><div>${name}</div><div style="font-weight:700">${t>=60?Math.round(t/60*10)/10+'m':t.toFixed(1)+'s'}</div><div>${ciBar(pct,t>60?W:G)}</div>`;
+        });
+        p7+=`</div></div>`;
+    }
 
-    # ✅ NOWE (MINIMALNA ZMIANA): obsługa listy dictów {ngram: "..."} dla kompatybilności.
-    if isinstance(ngrams, list) and ngrams and isinstance(ngrams[0], dict):
-        ngrams = [x.get("ngram", "") for x in ngrams if isinstance(x, dict) and x.get("ngram")]
+    // AI Competitive Summary
+    if(s1Data&&s1Data.competitive_summary){
+        p7+=`<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--bd)"><b>🤖 AI Summary</b><div style="margin-top:4px;font-size:10px;color:var(--lg);line-height:1.4;padding:6px;background:var(--bg2);border-radius:6px">${esc(s1Data.competitive_summary)}</div></div>`;
+    }
 
-    return jsonify(synthesize_topics(ngrams, data.get("headings", [])))
+    h+=ciSec('9️⃣','Batch Quality & Workflow Timeline',stepTimingData?`${Math.round(stepTimingData.total_seconds)}s`:'',p7);
 
-@app.route("/api/generate_compliance_report", methods=["POST"])
-def perform_generate_compliance_report():
-    data = request.get_json(force=True)
-    return jsonify(generate_compliance_report(data.get("text", ""), data.get("keyword_state", {})))
+    document.getElementById('ciB').innerHTML=h;
+    // Auto-expand panel 1
+    document.getElementById('ciB').querySelector('.ci-sec-b').classList.add('open');
+}
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({
-        "status": "ok",
-        "engine": "v28.0",
-        "limits": {
-            "max_content_per_page": MAX_CONTENT_SIZE,
-            "max_total_content": MAX_TOTAL_CONTENT,
-            "scrape_timeout": SCRAPE_TIMEOUT,
-            "skip_domains": SKIP_DOMAINS
-        },
-        "features": {
-            "gemini_enabled": bool(GEMINI_API_KEY),
-            "serpapi_enabled": bool(SERPAPI_KEY),
-            "paa_extraction": True,
-            "featured_snippet_extraction": True,
-            "ai_overview_extraction": True,
-            "related_searches_extraction": True,
-            "competitor_h2_analysis": True,
-            "competitor_word_count": True,
-            "full_content_scraping": True,
-            "oom_protection": True,
-            "keyword_alias_support": True,
-            # v28.0: Entity SEO
-            "entity_seo_enabled": ENTITY_SEO_ENABLED,
-            "entity_extraction": ENTITY_SEO_ENABLED,
-            "topical_coverage": ENTITY_SEO_ENABLED,
-            "entity_relationships": ENTITY_SEO_ENABLED,
-            # v28.0: content_hints WYŁĄCZONE (BRAJEN używa serp_analysis)
-            "content_hints_generation": False,
-            # v45.0: Causal Triplets + Gap Analysis
-            "causal_triplets_enabled": CAUSAL_EXTRACTOR_ENABLED,
-            "gap_analysis_enabled": GAP_ANALYZER_ENABLED,
-        }
-    })
 
-# ======================================================
-# 🧩 Uruchomienie lokalne
-# ======================================================
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+
+function renderArt(text){
+    const pv=document.getElementById('artP');
+    let html=text.replace(/^h2:\s*(.+)$/gm,'<h2>$1</h2>').replace(/^h3:\s*(.+)$/gm,'<h3>$1</h3>').replace(/\n\n/g,'</p><p>').replace(/^\s*<\/p>/,'');
+    if(!html.startsWith('<'))html='<p>'+html;if(!html.endsWith('>'))html+='</p>';
+    pv.innerHTML=html;pv.style.display='';
+}
+
+// Inline selection
+document.addEventListener('mouseup',function(ev){
+    const ap=document.getElementById('artP');
+    if(!ap||!ap.contains(ev.target))return;
+    const s=window.getSelection(),t=(s.toString()||'').trim();
+    if(t.length<3){hideInl();return}
+    selTxt=t;
+    const tb=document.getElementById('inlineTb'),r=s.getRangeAt(0).getBoundingClientRect();
+    tb.style.top=(r.bottom+window.scrollY+8)+'px';
+    tb.style.left=Math.max(10,Math.min(r.left,window.innerWidth-440))+'px';
+    tb.classList.add('vis');
+    document.getElementById('inlineIn').value='';
+    document.getElementById('inlineIn').focus();
+});
+function hideInl(){document.getElementById('inlineTb').classList.remove('vis');selTxt=''}
+document.addEventListener('mousedown',function(ev){
+    const tb=document.getElementById('inlineTb');
+    if(tb.classList.contains('vis')&&!tb.contains(ev.target)&&!document.getElementById('artP').contains(ev.target))hideInl();
+});
+
+async function sendInline(){
+    const ins=document.getElementById('inlineIn').value.trim();
+    if(!ins||!selTxt||!rawArticle)return;
+    hideInl();
+    addMsg('user',`✂️ "${selTxt.substring(0,60)}${selTxt.length>60?'…':''}" → ${ins}`);
+    await doEdit(ins,selTxt);
+}
+async function sendEdit(){
+    const ins=document.getElementById('chatIn').value.trim();
+    if(!ins||!rawArticle)return;
+    document.getElementById('chatIn').value='';
+    addMsg('user',ins);
+    await doEdit(ins,'');
+}
+function addMsg(role,text){
+    const h=document.getElementById('chatHist'),t=new Date().toLocaleTimeString('pl-PL',{hour:'2-digit',minute:'2-digit'});
+    h.innerHTML+=`<div class="chat-msg ${role}">${esc(text)}<div class="meta">${t}</div></div>`;
+    h.scrollTop=h.scrollHeight;
+}
+async function doEdit(instruction,selected){
+    const btn=document.getElementById('chatBtn');
+    btn.disabled=true;btn.textContent='Edytuję…';
+    try{
+        const resp=await fetch('/api/edit',{method:'POST',headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({instruction,article_text:rawArticle,selected_text:selected,job_id:jid})});
+        const data=await resp.json();
+        if(!resp.ok||data.error){addMsg('ai',`❌ ${data.error||'Błąd'}`);return}
+        if(selected&&data.edit_type==='inline'){
+            const idx=rawArticle.indexOf(selected);
+            if(idx>=0)rawArticle=rawArticle.substring(0,idx)+data.edited_text+rawArticle.substring(idx+selected.length);
+            else rawArticle=data.edited_text;
+        }else{rawArticle=data.edited_text}
+        renderArt(rawArticle);
+        const wc=rawArticle.split(/\s+/).filter(w=>w).length;
+        addMsg('ai',`✅ Gotowe! (${wc} słów, ${data.tokens_used||'?'} tokenów)`);
+        log(`✏️ Edycja: ${instruction.substring(0,50)}… [${data.edit_type}]`);
+    }catch(err){addMsg('ai',`❌ ${err.message}`)}
+    finally{btn.disabled=false;btn.textContent='Wyślij →'}
+}
+async function validateArt(){
+    if(!rawArticle||!jid)return;
+    const btn=document.getElementById('btnValidate'),vr=document.getElementById('valResult');
+    btn.classList.add('loading');btn.textContent='Walidacja…';vr.classList.remove('vis');
+    try{
+        const resp=await fetch('/api/validate',{method:'POST',headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({article_text:rawArticle,job_id:jid})});
+        const data=await resp.json();
+        if(!resp.ok||data.error){vr.innerHTML=`<span style="color:var(--rd)">❌ ${esc(data.error||'Niedostępne')}</span>`;vr.classList.add('vis');return}
+        const v=data.validation||{},score=v.score||v.quality_score||v.overall_score||'?',
+            status=v.status||v.quality_grade||'?',miss=v.missing_keywords||v.unused_keywords||[],
+            iss=v.issues||[],wc=rawArticle.split(/\s+/).filter(w=>w).length;
+        let h=`<div style="display:flex;gap:16px;align-items:center;margin-bottom:8px">`;
+        h+=`<span style="font-size:24px;font-weight:800;color:var(--orange)">${score}</span>`;
+        h+=`<span style="font-weight:700;color:${status==='PASS'?'var(--gn)':status==='WARN'?'var(--yl)':'var(--rd)'}">${status}</span>`;
+        h+=`<span style="color:var(--mg)">${wc} słów</span></div>`;
+        if(miss.length){h+=`<div style="margin:6px 0"><span style="color:var(--rd);font-weight:600">Brakujące (${miss.length}):</span> `;
+            h+=miss.slice(0,15).map(k=>`<span class="chip must">${esc(typeof k==='string'?k:k.keyword||JSON.stringify(k))}</span>`).join('')+'</div>'}
+        if(iss.length){h+=`<div style="margin:6px 0"><span style="color:var(--yl);font-weight:600">Issues (${iss.length}):</span> `;
+            h+=iss.slice(0,8).map(i=>`<span class="tag w">${esc(typeof i==='string'?i:i.message||JSON.stringify(i))}</span>`).join('')+'</div>'}
+        if(!miss.length&&!iss.length)h+=`<span style="color:var(--gn);font-weight:600">✓ Wszystko OK</span>`;
+        vr.innerHTML=h;vr.classList.add('vis');
+        log(`🔍 Walidacja: ${score} | ${status} | ${miss.length} brakujących`);
+    }catch(err){vr.innerHTML=`<span style="color:var(--rd)">❌ ${err.message}</span>`;vr.classList.add('vis')}
+    finally{btn.classList.remove('loading');btn.textContent='🔍 Zwaliduj'}
+}
+</script>
+</body>
+</html>
