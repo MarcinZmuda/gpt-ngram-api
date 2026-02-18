@@ -529,54 +529,129 @@ def perform_ngram_analysis():
 
     print(f"[S1] 🔍 Analiza n-gramów dla: {main_keyword}")
 
+    # ═══════════════════════════════════════════════════════════════════════════
     # 1️⃣ NLP Statystyczne (N-gramy)
+    # v52.0: LEMMA-BASED N-GRAMS + HIGH-SIGNAL SOURCES
+    #
+    # Problem który rozwiązujemy:
+    # A) FLEKSJA: "wpływem alkoholu", "wpływu alkoholu", "wpływ alkoholu" to ta
+    #    sama fraza - Surfer liczy je razem, Brajn liczył jako 3 osobne n-gramy.
+    #    FIX: indeksujemy po LEMATACH (canonical form), zachowujemy najczęstszą
+    #    formę powierzchniową do wyświetlania.
+    #
+    # B) BRAKUJĄCE FRAZY: "warunkowe umorzenie" pojawia się w related_searches /
+    #    PAA / snippetach ale rzadko w treści stron (bo to krótkie strony).
+    #    FIX: PAA + related_searches + snippety = "high-signal source" - niższy
+    #    próg freq dla tych fraz (wystarczy 1x, nie 2x).
+    # ═══════════════════════════════════════════════════════════════════════════
     ngram_presence = defaultdict(set)
     ngram_freqs = Counter()
-    ngram_per_source = defaultdict(lambda: Counter())  # v51: per-source freq for Surfer-style ranges
+    ngram_per_source = defaultdict(lambda: Counter())
+    lemma_surface_freq = defaultdict(Counter)  # lemma_key → {surface_form: count}
     all_text_content = []
 
+    def _lemmatize_tokens(text_content, limit=50000):
+        """Zwraca dwie listy: tokeny raw i tokeny-lematy (wyrównane, tylko alfa)."""
+        doc = nlp(text_content[:limit])
+        raw_toks, lem_toks = [], []
+        for t in doc:
+            if t.is_alpha:
+                raw_toks.append(t.text.lower())
+                lem_toks.append(t.lemma_.lower())
+        return raw_toks, lem_toks
+
+    def _build_ngrams_for_source(raw_toks, lem_toks, src_label, src_idx):
+        """Buduje n-gramy używając LEMATÓW jako klucza, surface form do wyświetlania."""
+        for n in range(2, 5):
+            for i in range(len(lem_toks) - n + 1):
+                lemma_key = " ".join(lem_toks[i:i + n])
+                surface_form = " ".join(raw_toks[i:i + n])
+                ngram_freqs[lemma_key] += 1
+                ngram_presence[lemma_key].add(src_label)
+                ngram_per_source[lemma_key][src_idx] += 1
+                lemma_surface_freq[lemma_key][surface_form] += 1
+
+    # ── Główne źródła: scraped pages ──────────────────────────────────────────
     for src_idx, src in enumerate(sources):
         content = (src.get("content", "") or "").lower()
         if not content.strip():
             continue
-
         all_text_content.append(src.get("content", ""))
-
-        # ⭐ Zbierz struktury H2 z konkurencji
         src_h2 = src.get("h2_structure", [])
         if src_h2:
             h2_patterns.extend(src_h2)
+        raw_toks, lem_toks = _lemmatize_tokens(content)
+        _build_ngrams_for_source(raw_toks, lem_toks, src.get("url", f"src_{src_idx}"), src_idx)
 
-        # ⭐ v22.3: Limit content for NLP processing
-        doc = nlp(content[:50000])  # Reduced from 100000
-        tokens = [t.text.lower() for t in doc if t.is_alpha]
+    # ── v52.0: High-signal sources: PAA + related searches + SERP snippets ────
+    # Google sam selekcjonuje te frazy - zawierają ważne słowa kluczowe których
+    # brak w krótkich stronach SERP (np. "warunkowe umorzenie", "dożywotni zakaz").
+    HIGH_SIGNAL_SRC_IDX = len(sources)
+    HIGH_SIGNAL_LABEL = "__google_signals__"
+    high_signal_texts = []
 
-        for n in range(2, 5):
-            for i in range(len(tokens) - n + 1):
-                ngram = " ".join(tokens[i:i + n])
-                ngram_freqs[ngram] += 1
-                ngram_presence[ngram].add(src.get("url", "unknown"))
-                ngram_per_source[ngram][src_idx] += 1  # v51: track per source
+    for paa_item in paa_questions:
+        q = paa_item.get("question", "") if isinstance(paa_item, dict) else str(paa_item)
+        if q:
+            high_signal_texts.append(q)
+    for rs in related_searches:
+        q = rs if isinstance(rs, str) else (rs.get("query", "") or rs.get("text", ""))
+        if q:
+            high_signal_texts.append(q)
+    for title in serp_titles:
+        if title:
+            high_signal_texts.append(title)
+    for snippet in serp_snippets:
+        if snippet:
+            high_signal_texts.append(snippet)
+
+    if high_signal_texts:
+        combined_signal = " . ".join(high_signal_texts)
+        raw_hs, lem_hs = _lemmatize_tokens(combined_signal, limit=20000)
+        _build_ngrams_for_source(raw_hs, lem_hs, HIGH_SIGNAL_LABEL, HIGH_SIGNAL_SRC_IDX)
+        print(f"[S1] 🎯 High-signal: {len(high_signal_texts)} tekstów (PAA+related+snippets) → dodane do n-gramów")
+
+    # ── Resolve best surface form per lemma-key ────────────────────────────────
+    lemma_to_surface = {}
+    for lemma_key, surface_counts in lemma_surface_freq.items():
+        lemma_to_surface[lemma_key] = surface_counts.most_common(1)[0][0]
 
     max_freq = max(ngram_freqs.values()) if ngram_freqs else 1
     num_sources = len(sources)
     results = []
 
     for ngram, freq in ngram_freqs.items():
-        if freq < 2:
+        # v52.0: Oddzielny próg dla high-signal vs stron
+        page_presence = {s for s in ngram_presence[ngram] if s != HIGH_SIGNAL_LABEL}
+        page_freq = sum(
+            cnt for idx, cnt in ngram_per_source[ngram].items()
+            if idx != HIGH_SIGNAL_SRC_IDX
+        )
+        is_high_signal_only = (HIGH_SIGNAL_LABEL in ngram_presence[ngram]
+                               and not page_presence)
+        # Stary filtr: min 2x w stronach; nowy: high-signal przechodzi przy freq>=1
+        if page_freq < 2 and not is_high_signal_only:
             continue
-        freq_norm = freq / max_freq
-        site_score = len(ngram_presence[ngram]) / len(sources) if sources else 0
+        # v52.0: Wyświetlamy najczęstszą formę powierzchniową, nie lemat
+        display_ngram = lemma_to_surface.get(ngram, ngram)
+
+        page_presence_set = {s for s in ngram_presence[ngram] if s != HIGH_SIGNAL_LABEL}
+        freq_norm = page_freq / max_freq if max_freq else 0
+        site_score = len(page_presence_set) / num_sources if num_sources else 0
         weight = round(freq_norm * 0.5 + site_score * 0.5, 4)
-        if main_keyword and main_keyword.lower() in ngram:
+
+        # Boost: fraza zawiera główne słowo kluczowe
+        if main_keyword and main_keyword.lower() in display_ngram:
             weight += 0.1
-        
-        # v51: Per-source frequency stats (Surfer-style ranges)
+        # Boost: fraza pochodzi z high-signal source (PAA/related/snippet)
+        if HIGH_SIGNAL_LABEL in ngram_presence[ngram]:
+            weight += 0.08
+
+        # v51/v52: Per-source frequency stats (Surfer-style ranges) — tylko prawdziwe strony
         per_src = ngram_per_source.get(ngram, {})
-        # Include 0 for sources that don't have this ngram
         all_counts = [per_src.get(i, 0) for i in range(num_sources)]
         non_zero = sorted([c for c in all_counts if c > 0])
-        
+
         if non_zero:
             freq_min = non_zero[0]
             freq_max = non_zero[-1]
@@ -584,12 +659,15 @@ def perform_ngram_analysis():
             freq_median = non_zero[mid] if len(non_zero) % 2 == 1 else (non_zero[mid-1] + non_zero[mid]) // 2
         else:
             freq_min = freq_median = freq_max = 0
-        
+
         results.append({
-            "ngram": ngram,
-            "freq": freq,
+            "ngram": display_ngram,          # najczęstsza forma powierzchniowa
+            "ngram_lemma": ngram,            # lemat (do dedup w keyword_counter)
+            "freq": page_freq,               # tylko z prawdziwych stron
+            "freq_total": freq,              # łącznie z high-signal
+            "is_high_signal": is_high_signal_only,
             "weight": min(1.0, weight),
-            "site_distribution": f"{len(ngram_presence[ngram])}/{len(sources)}",
+            "site_distribution": f"{len(page_presence_set)}/{num_sources}",
             "freq_per_source": all_counts,
             "freq_min": freq_min,
             "freq_median": freq_median,
