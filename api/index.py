@@ -394,17 +394,6 @@ def fetch_serp_sources(keyword, num_results=10):
                 h2_tags = re.findall(r'<h2[^>]*>(.*?)</h2>', raw_html, re.IGNORECASE | re.DOTALL)
                 h2_clean = [re.sub(r'<[^>]+>', '', h).strip() for h in h2_tags]
                 h2_clean = [h for h in h2_clean if h and len(h) < 200 and not re.search(r'[{};]|webkit|moz-|flex-|align-items', h, re.IGNORECASE)]
-                # v49: Filter navigation H2s at scraping time
-                _NAV_H2 = {
-                    "wyszukiwarka", "nawigacja", "moje strony", "mapa serwisu", "mapa strony",
-                    "biuletyn informacji publicznej", "redakcja serwisu", "dostępność",
-                    "nota prawna", "polityka prywatności", "regulamin", "newsletter",
-                    "social media", "archiwum", "logowanie", "rejestracja",
-                    "inne wersje portalu", "kontakt", "o nas", "strona główna",
-                    "menu główne", "szukaj", "przydatne linki", "stopka", "cookie",
-                    "deklaracja dostępności", "komenda miejska",
-                }
-                h2_clean = [h for h in h2_clean if h.strip().lower() not in _NAV_H2 and not any(nav in h.strip().lower() for nav in _NAV_H2 if len(nav) >= 10)]
 
                 # Ekstrakcja treści — trafilatura lub regex fallback
                 content = None
@@ -543,9 +532,10 @@ def perform_ngram_analysis():
     # 1️⃣ NLP Statystyczne (N-gramy)
     ngram_presence = defaultdict(set)
     ngram_freqs = Counter()
+    ngram_per_source = defaultdict(lambda: Counter())  # v51: per-source freq for Surfer-style ranges
     all_text_content = []
 
-    for src in sources:
+    for src_idx, src in enumerate(sources):
         content = (src.get("content", "") or "").lower()
         if not content.strip():
             continue
@@ -566,8 +556,10 @@ def perform_ngram_analysis():
                 ngram = " ".join(tokens[i:i + n])
                 ngram_freqs[ngram] += 1
                 ngram_presence[ngram].add(src.get("url", "unknown"))
+                ngram_per_source[ngram][src_idx] += 1  # v51: track per source
 
     max_freq = max(ngram_freqs.values()) if ngram_freqs else 1
+    num_sources = len(sources)
     results = []
 
     for ngram, freq in ngram_freqs.items():
@@ -578,11 +570,30 @@ def perform_ngram_analysis():
         weight = round(freq_norm * 0.5 + site_score * 0.5, 4)
         if main_keyword and main_keyword.lower() in ngram:
             weight += 0.1
+        
+        # v51: Per-source frequency stats (Surfer-style ranges)
+        per_src = ngram_per_source.get(ngram, {})
+        # Include 0 for sources that don't have this ngram
+        all_counts = [per_src.get(i, 0) for i in range(num_sources)]
+        non_zero = sorted([c for c in all_counts if c > 0])
+        
+        if non_zero:
+            freq_min = non_zero[0]
+            freq_max = non_zero[-1]
+            mid = len(non_zero) // 2
+            freq_median = non_zero[mid] if len(non_zero) % 2 == 1 else (non_zero[mid-1] + non_zero[mid]) // 2
+        else:
+            freq_min = freq_median = freq_max = 0
+        
         results.append({
             "ngram": ngram,
             "freq": freq,
             "weight": min(1.0, weight),
-            "site_distribution": f"{len(ngram_presence[ngram])}/{len(sources)}"
+            "site_distribution": f"{len(ngram_presence[ngram])}/{len(sources)}",
+            "freq_per_source": all_counts,
+            "freq_min": freq_min,
+            "freq_median": freq_median,
+            "freq_max": freq_max
         })
 
     results = sorted(results, key=lambda x: x["weight"], reverse=True)[:top_n]
