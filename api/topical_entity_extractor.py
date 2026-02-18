@@ -334,9 +334,51 @@ def extract_topical_entities(
             continue
         
         # Najczęstsza forma powierzchniowa = display text
-        most_common_form = data["surface_forms"].most_common(1)[0][0]
-        
-        # Wszystkie warianty
+        # v52.1: Spellcheck — preferuj formy bez oczywistych literówek.
+        # Literówka = słowo z sekwencją 3+ spółgłosek BEZ samogłoski (np. "uchwtów")
+        # lub krótkie słowo z brakującymi literami w środku.
+        def _has_typo(word: str) -> bool:
+            """Heurystyczna detekcja literówki w polskim słowie.
+
+            v52.1: Reguła: 4+ spółgłosek z rzędu po pierwszej samogłosce = literówka.
+            Polskie grupy na POCZĄTKU słowa (strz, prz, chr, szcz) są dozwolone.
+            W środku słowa sekwencja 4+ spółgłosek = brakujące litery.
+            Przykład: 'uchwtów' → po 'u' pojawia się 'chwt' (4 spółgłoski) = literówka.
+            """
+            vowels = set("aąeęioóuy")
+            w = word.lower()
+            i = 0
+            # Pomiń początkową grupę spółgłosek (dozwolone w polskim: strz, prz, chr itp.)
+            while i < len(w) and w[i].isalpha() and w[i] not in vowels:
+                i += 1
+            # Skanuj resztę słowa — mid-word 4+ spółgłoski = literówka
+            cluster = 0
+            while i < len(w):
+                ch = w[i]
+                if not ch.isalpha():
+                    cluster = 0
+                elif ch in vowels:
+                    cluster = 0
+                else:
+                    cluster += 1
+                    if cluster >= 4:
+                        return True
+                i += 1
+            return False
+
+        def _best_surface_form(surface_forms_counter):
+            """Wybiera najczęstszą formę, ale pomija ewidentne literówki."""
+            candidates = surface_forms_counter.most_common()
+            for form, count in candidates:
+                words_in_form = form.split()
+                if not any(_has_typo(w) for w in words_in_form):
+                    return form
+            # Fallback: zwróć najczęstszą mimo potencjalnej literówki
+            return candidates[0][0]
+
+        most_common_form = _best_surface_form(data["surface_forms"])
+
+        # Wszystkie warianty (bez literówek na pierwszym miejscu)
         variants = [form for form, _ in data["surface_forms"].most_common(5)]
         
         # Typ: CONCEPT (1-2 słowa) lub TOPICAL (3+ słów)
