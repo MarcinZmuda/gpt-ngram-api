@@ -100,8 +100,19 @@ class TopicalEntity:
     importance: float = 0.5      # Score 0-1
     contexts: List[str] = field(default_factory=list)
     variants: List[str] = field(default_factory=list)  # Odmiany
+    freq_per_source: List[int] = field(default_factory=list)  # v51: per-source frequency
     
     def to_dict(self) -> Dict:
+        # v51: Compute Surfer-style frequency ranges
+        non_zero = sorted([c for c in self.freq_per_source if c > 0]) if self.freq_per_source else []
+        if non_zero:
+            freq_min = non_zero[0]
+            freq_max = non_zero[-1]
+            mid = len(non_zero) // 2
+            freq_median = non_zero[mid] if len(non_zero) % 2 == 1 else (non_zero[mid-1] + non_zero[mid]) // 2
+        else:
+            freq_min = freq_median = freq_max = 0
+        
         return {
             "text": self.display_text,
             "type": self.type,
@@ -110,6 +121,10 @@ class TopicalEntity:
             "importance": round(self.importance, 3),
             "sample_context": self.contexts[0] if self.contexts else "",
             "variants": self.variants[:5],
+            "freq_per_source": self.freq_per_source,
+            "freq_min": freq_min,
+            "freq_median": freq_median,
+            "freq_max": freq_max,
         }
 
 
@@ -233,6 +248,7 @@ def extract_topical_entities(
         "surface_forms": Counter(),  # Zlicza formy powierzchniowe
         "contexts": [],
         "word_count": 0,
+        "freq_per_source": Counter(),  # v51: per-source frequency
     })
     
     # Keyword lemmas (do relevance boosting)
@@ -292,6 +308,7 @@ def extract_topical_entities(
                 data["sources"].add(urls[idx])
                 data["surface_forms"][normalized] += 1
                 data["word_count"] = max(data["word_count"], len(words))
+                data["freq_per_source"][idx] += 1  # v51: per-source tracking
                 
                 # Kontekst (max 3 per entity)
                 if len(data["contexts"]) < 3:
@@ -356,6 +373,9 @@ def extract_topical_entities(
                 relevance = len(overlap) / max(len(keyword_words), 1)
                 score += relevance * 0.20
         
+        # v51: Build per-source frequency list (include 0 for sources without this entity)
+        per_src_counts = [data["freq_per_source"].get(i, 0) for i in range(total_sources)]
+        
         entity = TopicalEntity(
             text=lemma_key,
             display_text=most_common_form,
@@ -365,6 +385,7 @@ def extract_topical_entities(
             importance=min(1.0, score),
             contexts=data["contexts"],
             variants=variants,
+            freq_per_source=per_src_counts,
         )
         entities.append(entity)
     
