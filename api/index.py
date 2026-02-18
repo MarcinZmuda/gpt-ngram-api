@@ -383,7 +383,19 @@ def fetch_serp_sources(keyword, num_results=10):
                     print(f"[S1] ⚠️ HTTP {page_response.status_code} from {url[:40]}")
                     return None
 
-                raw_html = page_response.text
+                # v52.4: Smart encoding — requests domyślnie używa ISO-8859-1 dla text/html
+                # bez deklaracji charset w nagłówkach, co powoduje pojÄciem zamiast pojęciem.
+                content_type = page_response.headers.get('Content-Type', '')
+                if 'charset=' in content_type.lower():
+                    raw_html = page_response.text  # Zaufaj zadeklarowanemu charset
+                else:
+                    try:
+                        raw_html = page_response.content.decode('utf-8')
+                    except UnicodeDecodeError:
+                        try:
+                            raw_html = page_response.content.decode('windows-1250')
+                        except UnicodeDecodeError:
+                            raw_html = page_response.content.decode('utf-8', errors='replace')
 
                 # Limit content size PRZED przetwarzaniem
                 if len(raw_html) > MAX_CONTENT_SIZE * 2:
