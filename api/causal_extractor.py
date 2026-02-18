@@ -215,16 +215,37 @@ def extract_causal_triplets(
 
 
 def _clean_triplet_part(text: str) -> str:
-    """Oczyszcza fragment tripletu."""
+    """Oczyszcza fragment tripletu.
+
+    v52.1: Dodatkowe filtry — odrzucamy ucięte/zaśmiecone fragmenty ze SERP:
+    - Usuwa HTML tagi i HTML entities
+    - Odrzuca fragmenty zaczynające się od małej litery (ucięty środek zdania)
+    - Odrzuca fragmenty z sekwencjami HTML/JS (\\r\\n, strong>, itp.)
+    """
+    # Usuń HTML tagi
+    text = re.sub(r'<[^>]+>', ' ', text)
+    # Usuń HTML entities (np. &Oacute;, &amp;, \u003c)
+    text = re.sub(r'&[A-Za-z]{2,8};', '', text)
+    text = re.sub(r'&#\d+;', '', text)
+    text = re.sub(r'\\u[0-9a-fA-F]{4}', '', text)
     # Usuń leading/trailing interpunkcję
     text = text.strip(' ,;:–—-"\'()[]')
     # Usuń wielokrotne spacje
     text = re.sub(r'\s+', ' ', text)
-    # Obetnij do pierwszego zdania (jeśli złapaliśmy za dużo)
+    # Obetnij do pierwszego zdania
     if '.' in text:
         text = text.split('.')[0]
-    return text.strip()
+    text = text.strip()
 
+    if not text:
+        return ""
+    # Odrzuć fragment zaczynający się od małej litery (ucięty środek zdania z HTML)
+    if text[0].islower():
+        return ""
+    # Odrzuć fragment z HTML/JS artefaktami
+    if re.search(r'\\r|\\n|strong>|<\/|\\u[0-9a-f]{4}', text, re.IGNORECASE):
+        return ""
+    return text
 
 def _build_chains(triplets: List[CausalTriplet]) -> None:
     """
