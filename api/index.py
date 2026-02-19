@@ -231,6 +231,65 @@ def generate_content_hints(serp_analysis, main_keyword):
 # ======================================================
 # 🔍 Helper: Fetch sources from SerpAPI (FULL SERP DATA)
 # ======================================================
+def _generate_paa_claude_fallback(keyword: str, serp_data: dict) -> list:
+    """
+    Fallback: gdy SerpAPI nie zwróci related_questions,
+    generuj PAA z Claude na podstawie keyword + snippetów SERP.
+    """
+    import os as _os, json as _json
+    api_key = _os.getenv("ANTHROPIC_API_KEY") or _os.getenv("CLAUDE_API_KEY")
+    if not api_key:
+        print("[PAA_FALLBACK] No Anthropic API key")
+        return []
+    try:
+        import anthropic as _anthropic
+        client = _anthropic.Anthropic(api_key=api_key)
+
+        # Zbierz kontekst z SERP
+        snippets = []
+        for r in (serp_data.get("organic_results") or [])[:6]:
+            t = r.get("title", "")
+            s = r.get("snippet", "")
+            if t or s:
+                snippets.append(f"- {t}: {s}")
+
+        ai_ov = serp_data.get("ai_overview", {})
+        ai_text = ""
+        if isinstance(ai_ov, dict):
+            ai_text = ai_ov.get("text", "") or ""
+        elif isinstance(ai_ov, str):
+            ai_text = ai_ov
+
+        context = "\n".join(snippets[:6])
+        if ai_text:
+            context = "AI Overview: " + ai_text[:300] + "\n\n" + context
+
+        prompt = (
+            f"Dla frazy: \"{keyword}\"\n"
+            f"Kontekst z Google:\n{context[:1500]}\n\n"
+            "Wygeneruj 6 pytań które użytkownicy zadają w sekcji \"Ludzie pytają też\" (People Also Ask) na Google.\n"
+            "Pytania muszą być po polsku, konkretne, rzeczowe.\n"
+            "Zwróć TYLKO JSON array: [{\"question\": \"...\", \"answer\": \"...\"}]\n"
+            "Każda odpowiedź 1-2 zdania."
+        )
+
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=800,
+            temperature=0,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = resp.content[0].text.strip()
+        import re as _re
+        m = _re.search(r"\[[\s\S]*\]", text)
+        if m:
+            questions = _json.loads(m.group())
+            return [{"question": q.get("question",""), "answer": q.get("answer",""), "source": "claude_fallback"} for q in questions if q.get("question")]
+    except Exception as e:
+        print(f"[PAA_FALLBACK] Error: {e}")
+    return []
+
+
 def fetch_serp_sources(keyword, num_results=10):
     """
     Pobiera PEŁNE dane z Google przez SerpAPI:
@@ -306,6 +365,12 @@ def fetch_serp_sources(keyword, num_results=10):
             })
         if paa_questions:
             print(f"[S1] ✅ Found {len(paa_questions)} PAA questions")
+        else:
+            # Fallback: generuj PAA z Claude gdy SerpAPI nie zwróciło related_questions
+            print(f"[S1] ⚠️ No PAA from SerpAPI — generating with Claude fallback...")
+            paa_questions = _generate_paa_claude_fallback(keyword, serp_data)
+            if paa_questions:
+                print(f"[S1] ✅ Claude PAA fallback: {len(paa_questions)} questions generated")
 
         # ⭐ 3. Wyciągnij Featured Snippet (Answer Box)
         featured_snippet = None
@@ -591,7 +656,13 @@ def perform_ngram_analysis():
         all_text_content.append(src.get("content", ""))
         src_h2 = src.get("h2_structure", [])
         if src_h2:
-            h2_patterns.extend(src_h2)
+            # Track which source each H2 comes from for frequency counting
+            for h2_item in src_h2:
+                if isinstance(h2_item, str):
+                    h2_patterns.append({"text": h2_item, "source_idx": src_idx})
+                elif isinstance(h2_item, dict):
+                    h2_item["source_idx"] = src_idx
+                    h2_patterns.append(h2_item)
         raw_toks, lem_toks = _lemmatize_tokens(content)
         _build_ngrams_for_source(raw_toks, lem_toks, src.get("url", f"src_{src_idx}"), src_idx)
 
@@ -692,8 +763,31 @@ def perform_ngram_analysis():
     full_text_sample = " ".join(all_text_content)[:15000]
     semantic_keyphrases = extract_semantic_tags_gemini(full_text_sample)
 
-    # ⭐ Unikalne H2 z konkurencji (bez duplikatów)
-    unique_h2_patterns = list(dict.fromkeys(h2_patterns))[:30]
+    # ⭐ H2 konkurencji z CZĘSTOŚCIĄ (ile stron używa danego wzorca)
+    # Liczymy per source żeby H2 z 1 strony nie zdominowało przez repetycje
+    h2_source_counts = {}   # h2_text → set of source indices
+    for item in h2_patterns:
+        if isinstance(item, dict):
+            h2_text = item.get("text", item.get("h2", "")).strip()
+            src_idx = item.get("source_idx", 0)
+        else:
+            h2_text = str(item).strip()
+            src_idx = 0
+        if not h2_text or len(h2_text) < 4:
+            continue
+        if h2_text not in h2_source_counts:
+            h2_source_counts[h2_text] = set()
+        h2_source_counts[h2_text].add(src_idx)
+
+    # Sort by number of sources (descending) — most common across competitors first
+    sorted_h2 = sorted(h2_source_counts.items(), key=lambda x: len(x[1]), reverse=True)
+    unique_h2_patterns = [
+        {"text": h2, "count": len(srcs), "sources": len(srcs)}
+        for h2, srcs in sorted_h2[:30]
+    ]
+    print(f"[S1] 📊 H2 patterns: {len(unique_h2_patterns)} unique "
+          f"(top: {unique_h2_patterns[0]['text'][:40] if unique_h2_patterns else 'none'} "
+          f"x{unique_h2_patterns[0]['count'] if unique_h2_patterns else 0})")
 
     # ⭐ Przygotuj serp_analysis
     serp_analysis_data = {
