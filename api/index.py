@@ -4,7 +4,12 @@ import re
 import requests
 from collections import Counter, defaultdict
 from flask import Flask, request, jsonify
-import spacy
+try:
+    import spacy
+    SPACY_AVAILABLE = True
+except ImportError:
+    spacy = None
+    SPACY_AVAILABLE = False
 import google.generativeai as genai
 import firebase_admin
 from firebase_admin import credentials, firestore
