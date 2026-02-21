@@ -795,6 +795,8 @@ def perform_ngram_analysis():
           f"x{unique_h2_patterns[0]['count'] if unique_h2_patterns else 0})")
 
     # ⭐ Przygotuj serp_analysis
+    # v53.0: Standaryzacja — competitors zawiera title, snippet, url
+    # Mapowanie snippet do competitor na podstawie pozycji w SERP
     serp_analysis_data = {
         "paa_questions": paa_questions,
         "featured_snippet": featured_snippet,
@@ -803,16 +805,39 @@ def perform_ngram_analysis():
         "competitor_titles": serp_titles[:10],
         "competitor_snippets": serp_snippets[:10],
         "competitor_h2_patterns": unique_h2_patterns,
-        # v27.0: Dodaj competitors z word_count dla recommended_length
+        # v53.0: competitors z title, snippet, url, word_count, h2_count
         "competitors": [
             {
                 "url": src.get("url", ""),
                 "title": src.get("title", ""),
+                "snippet": serp_snippets[i] if i < len(serp_snippets) else "",
                 "word_count": src.get("word_count", 0),
                 "h2_count": len(src.get("h2_structure", []))
             }
-            for src in sources
+            for i, src in enumerate(sources)
         ]
+    }
+
+    # v53.0: Analiza długości — recommended_length na podstawie competitors
+    word_counts = [src.get("word_count", 0) for src in sources if src.get("word_count", 0) > 0]
+    if word_counts:
+        avg_word_count = int(sum(word_counts) / len(word_counts))
+        median_idx = len(word_counts) // 2
+        sorted_wc = sorted(word_counts)
+        median_word_count = sorted_wc[median_idx] if len(sorted_wc) % 2 == 1 else (sorted_wc[median_idx - 1] + sorted_wc[median_idx]) // 2
+        recommended_length = int(avg_word_count * 1.1)  # 10% więcej niż średnia
+    else:
+        avg_word_count = 0
+        median_word_count = 0
+        recommended_length = 0
+
+    length_analysis = {
+        "recommended": recommended_length,
+        "avg_competitor": avg_word_count,
+        "median_competitor": median_word_count,
+        "min_competitor": min(word_counts) if word_counts else 0,
+        "max_competitor": max(word_counts) if word_counts else 0,
+        "competitors_count": len(word_counts),
     }
 
     # 3️⃣ Content Hints - WYŁĄCZONE v28.0 (duplikuje dane z serp_analysis)
@@ -843,10 +868,31 @@ def perform_ngram_analysis():
                 texts=[s.get("content", "") for s in sources],
                 main_keyword=main_keyword
             )
+            # v53.0: Standaryzacja — chains zawierają cause/mechanism/effect,
+            # singles zawierają cause/effect (bez mechanism)
+            causal_chains = []
+            for t in causal_triplets:
+                if t.is_chain:
+                    causal_chains.append({
+                        "cause": t.cause,
+                        "mechanism": t.relation_type,
+                        "effect": t.effect,
+                        "confidence": t.confidence,
+                        "source_sentence": t.source_sentence,
+                    })
+            causal_singles = []
+            for t in causal_triplets:
+                if not t.is_chain:
+                    causal_singles.append({
+                        "cause": t.cause,
+                        "effect": t.effect,
+                        "confidence": t.confidence,
+                        "source_sentence": t.source_sentence,
+                    })
             causal_data = {
                 "count": len(causal_triplets),
-                "chains": [t.to_dict() for t in causal_triplets if t.is_chain],
-                "singles": [t.to_dict() for t in causal_triplets if not t.is_chain],
+                "chains": causal_chains,
+                "singles": causal_singles,
                 "agent_instruction": format_causal_for_agent(causal_triplets, main_keyword)
             }
             print(f"[S1] ✅ Causal Triplets: {len(causal_triplets)} found "
@@ -860,19 +906,43 @@ def perform_ngram_analysis():
     if GAP_ANALYZER_ENABLED and sources:
         try:
             print(f"[S1] 📊 Running Gap Analysis...")
-            content_gaps_data = analyze_content_gaps(
+            # v53.0: Przekaż H2 jako listę stringów (gap_analyzer oczekuje list of str)
+            h2_texts = [
+                p.get("text", "") if isinstance(p, dict) else str(p)
+                for p in unique_h2_patterns
+            ]
+            raw_gaps = analyze_content_gaps(
                 competitor_texts=[s.get("content", "") for s in sources],
-                competitor_h2s=unique_h2_patterns,
+                competitor_h2s=h2_texts,
                 paa_questions=paa_questions,
                 related_searches=related_searches,
                 main_keyword=main_keyword
             )
+            # v53.0: Standaryzacja — dodaj flat string lists obok pełnych obiektów
+            content_gaps_data = {
+                "total_gaps": raw_gaps.get("total_gaps", 0),
+                "suggested_new_h2s": raw_gaps.get("suggested_new_h2s", []),
+                "paa_unanswered": [
+                    g.get("topic", "") for g in raw_gaps.get("paa_unanswered", [])
+                ],
+                "subtopic_missing": [
+                    g.get("topic", "") for g in raw_gaps.get("subtopic_missing", [])
+                ],
+                "depth_missing": [
+                    g.get("topic", "") for g in raw_gaps.get("depth_missing", [])
+                ],
+                "instruction": raw_gaps.get("agent_instruction", ""),
+                # Zachowaj pełne obiekty dla kompatybilności
+                "all_gaps": raw_gaps.get("all_gaps", []),
+                "status": raw_gaps.get("status", "OK"),
+            }
             print(f"[S1] ✅ Content Gaps: {content_gaps_data.get('total_gaps', 0)} gaps found")
         except Exception as e:
             print(f"[S1] ⚠️ Gap Analysis error (non-critical): {e}")
             content_gaps_data = {"error": str(e), "status": "FAILED"}
 
     # ⭐ PEŁNA ODPOWIEDŹ z wszystkimi danymi SERP
+    # v53.0: Standaryzacja — ujednolicone pola, aliasy dla kompatybilności
     response_payload = {
         "main_keyword": main_keyword,
         "ngrams": results,
@@ -887,16 +957,23 @@ def perform_ngram_analysis():
         # ⭐ Pełna analiza SERP (surowe dane)
         "serp_analysis": serp_analysis_data,
 
-        # ⭐ Content Hints - WYŁĄCZONE v28.0 (BRAJEN używa serp_analysis bezpośrednio)
-        # "content_hints": content_hints,
+        # v53.0: Top-level PAA alias (ZAWSZE obecny, wskazuje na serp_analysis.paa_questions)
+        "paa": paa_questions,
+
+        # v53.0: Analiza długości (recommended_length + dane kompetytorów)
+        "length_analysis": length_analysis,
+        "recommended_length": recommended_length,
+
+        # v53.0: Top-level H2 patterns alias
+        "competitor_h2_patterns": unique_h2_patterns,
 
         # 🆕 Entity SEO (v28.0)
         "entity_seo": entity_seo_data,
 
-        # 🆕 Causal Triplets (v45.0)
+        # 🆕 Causal Triplets (v45.0, v53.0: standaryzacja chains/singles)
         "causal_triplets": causal_data,
 
-        # 🆕 Content Gaps (v45.0)
+        # 🆕 Content Gaps (v45.0, v53.0: flat string lists + instruction)
         "content_gaps": content_gaps_data,
 
         "summary": {
@@ -911,7 +988,8 @@ def perform_ngram_analysis():
             "entities_found": entity_seo_data.get("entity_seo_summary", {}).get("total_entities", 0) if entity_seo_data else 0,
             "causal_triplets_found": causal_data.get("count", 0) if causal_data else 0,
             "content_gaps_found": content_gaps_data.get("total_gaps", 0) if content_gaps_data else 0,
-            "engine": "v28.0",
+            "recommended_length": recommended_length,
+            "engine": "v53.0",
             "lsi_candidates": len(semantic_keyphrases),
         }
     }
@@ -944,6 +1022,15 @@ def perform_ngram_analysis():
     return jsonify(response_payload)
 
 # ======================================================
+# v53.0: /api/s1_analysis — Alias for /api/ngram_entity_analysis
+# Frontend oczekuje tego endpointu pod tą nazwą
+# ======================================================
+@app.route("/api/s1_analysis", methods=["POST"])
+def perform_s1_analysis():
+    """Alias — deleguje do perform_ngram_analysis."""
+    return perform_ngram_analysis()
+
+# ======================================================
 # 🧩 Pozostałe Endpointy (Proxy)
 # ======================================================
 @app.route("/api/synthesize_topics", methods=["POST"])
@@ -962,11 +1049,37 @@ def perform_generate_compliance_report():
     data = request.get_json(force=True)
     return jsonify(generate_compliance_report(data.get("text", ""), data.get("keyword_state", {})))
 
+# ======================================================
+# v53.0: Global JSON Error Handlers
+# NIGDY nie zwracaj HTML error pages — ZAWSZE Content-Type: application/json
+# ======================================================
+@app.errorhandler(400)
+def handle_400(e):
+    return jsonify({"error": "Bad Request", "details": str(e)}), 400
+
+@app.errorhandler(404)
+def handle_404(e):
+    return jsonify({"error": "Not Found", "details": str(e)}), 404
+
+@app.errorhandler(405)
+def handle_405(e):
+    return jsonify({"error": "Method Not Allowed", "details": str(e)}), 405
+
+@app.errorhandler(500)
+def handle_500(e):
+    return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    print(f"[ERROR] Unhandled exception: {e}")
+    return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
-        "engine": "v28.0",
+        "engine": "v53.0",
         "limits": {
             "max_content_per_page": MAX_CONTENT_SIZE,
             "max_total_content": MAX_TOTAL_CONTENT,
@@ -995,6 +1108,9 @@ def health():
             # v45.0: Causal Triplets + Gap Analysis
             "causal_triplets_enabled": CAUSAL_EXTRACTOR_ENABLED,
             "gap_analysis_enabled": GAP_ANALYZER_ENABLED,
+            # v53.0
+            "s1_analysis_alias": True,
+            "json_error_handlers": True,
         }
     })
 
