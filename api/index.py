@@ -330,7 +330,8 @@ def fetch_serp_sources(keyword, num_results=10):
                 "api_key": SERPAPI_KEY,
                 "num": num_results,
                 "hl": "pl",
-                "gl": "pl"
+                "gl": "pl",
+                "no_cache": "true",
             },
             timeout=30
         )
