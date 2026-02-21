@@ -32,13 +32,34 @@ SCRAPE_TIMEOUT = 8            # 8 sekund timeout per page (było 10)
 SKIP_DOMAINS = ['bip.', '.pdf', 'gov.pl/dana/', '/uploads/files/']  # Skip duże dokumenty
 
 # ======================================================
-# 🔑 SerpAPI Configuration
+# 🔑 SERP Provider Configuration (v55.0: DataForSEO + SerpAPI)
 # ======================================================
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 if SERPAPI_KEY:
     print("[S1] ✅ SerpAPI key configured")
 else:
-    print("[S1] ⚠️ SERPAPI_KEY not set — auto-fetch disabled")
+    print("[S1] ⚠️ SERPAPI_KEY not set")
+
+# v55.0: DataForSEO as alternative/primary SERP provider
+try:
+    try:
+        from .dataforseo_provider import is_available as dataforseo_available, fetch_serp_data as dataforseo_fetch, fetch_raw_debug as dataforseo_debug
+    except ImportError:
+        from dataforseo_provider import is_available as dataforseo_available, fetch_serp_data as dataforseo_fetch, fetch_raw_debug as dataforseo_debug
+    DATAFORSEO_ENABLED = dataforseo_available()
+except ImportError:
+    DATAFORSEO_ENABLED = False
+    dataforseo_fetch = None
+    dataforseo_debug = None
+    print("[S1] ⚠️ dataforseo_provider module not found")
+
+if DATAFORSEO_ENABLED:
+    print("[S1] ✅ DataForSEO provider available")
+
+# SERP_PROVIDER: "dataforseo", "serpapi", or "auto" (default)
+# "auto" = use DataForSEO if configured, fallback to SerpAPI
+SERP_PROVIDER = os.getenv("SERP_PROVIDER", "auto").lower()
+print(f"[S1] 🔧 SERP_PROVIDER={SERP_PROVIDER} (DataForSEO={'✅' if DATAFORSEO_ENABLED else '❌'}, SerpAPI={'✅' if SERPAPI_KEY else '❌'})")
 
 # ======================================================
 # 🔥 Firebase Initialization (Safe for Render & Local)
@@ -296,121 +317,110 @@ def _generate_paa_claude_fallback(keyword: str, serp_data: dict) -> list:
     return []
 
 
-def fetch_serp_sources(keyword, num_results=10):
+def _fetch_serpapi_data(keyword, num_results=10):
     """
-    Pobiera PEŁNE dane z Google przez SerpAPI:
-    - Organic results (top 10 stron) + scrapuje ich pełną treść
-    - PAA (People Also Ask)
-    - Featured Snippet
-    - Related Searches
-    - Tytuły i snippety z SERP
-    
-    ⭐ v22.3: Dodano limity rozmiaru i skip dla dużych dokumentów
+    v55.0: SerpAPI provider — fetches SERP metadata (PAA, AI Overview, etc.)
+    Returns standardized dict + organic_results for scraping.
     """
     empty_result = {
-        "sources": [],
         "paa": [],
         "featured_snippet": None,
-        "ai_overview": None,  # v27.0
+        "ai_overview": None,
         "related_searches": [],
         "serp_titles": [],
-        "serp_snippets": []
+        "serp_snippets": [],
+        "organic_results": [],
     }
 
     if not SERPAPI_KEY:
-        print("[S1] ⚠️ SerpAPI key not configured - cannot fetch sources")
+        print("[S1] ⚠️ SerpAPI key not configured")
         return empty_result
 
-    try:
-        print(f"[S1] 🔍 Fetching FULL SERP data for: {keyword}")
-        serp_response = requests.get(
-            "https://serpapi.com/search",
-            params={
-                "q": keyword,
-                "api_key": SERPAPI_KEY,
-                "num": num_results,
-                "hl": "pl",
-                "gl": "pl",
-                "no_cache": "true",
-            },
-            timeout=30
-        )
+    print(f"[S1/SerpAPI] 🔍 Fetching SERP data for: {keyword}")
+    serp_response = requests.get(
+        "https://serpapi.com/search",
+        params={
+            "q": keyword,
+            "api_key": SERPAPI_KEY,
+            "num": num_results,
+            "hl": "pl",
+            "gl": "pl",
+            "no_cache": "true",
+        },
+        timeout=30
+    )
 
-        if serp_response.status_code != 200:
-            print(f"[S1] ❌ SerpAPI error: {serp_response.status_code}")
-            return empty_result
+    if serp_response.status_code != 200:
+        print(f"[S1/SerpAPI] ❌ HTTP {serp_response.status_code}")
+        return empty_result
 
-        serp_data = serp_response.json()
+    serp_data = serp_response.json()
 
-        # v54.0: Debug — loguj klucze SerpAPI response żeby diagnozować brakujące dane
-        serp_keys = list(serp_data.keys())
-        print(f"[S1] 🔑 SerpAPI response keys: {serp_keys}")
-        if "related_questions" in serp_data:
-            print(f"[S1] 📋 related_questions count: {len(serp_data['related_questions'])}")
-        else:
-            print(f"[S1] ⚠️ NO 'related_questions' key in SerpAPI response (PAA unavailable for this query)")
-        if "ai_overview" in serp_data:
-            aio_keys = list(serp_data["ai_overview"].keys()) if isinstance(serp_data["ai_overview"], dict) else "non-dict"
-            print(f"[S1] 🤖 ai_overview keys: {aio_keys}")
-        else:
-            print(f"[S1] ⚠️ NO 'ai_overview' key in SerpAPI response")
-        if "answer_box" in serp_data:
-            print(f"[S1] 📦 answer_box type: {serp_data['answer_box'].get('type', 'unknown')}")
+    # Debug logging
+    serp_keys = list(serp_data.keys())
+    print(f"[S1/SerpAPI] 🔑 Response keys: {serp_keys}")
+    if "related_questions" in serp_data:
+        print(f"[S1/SerpAPI] 📋 related_questions count: {len(serp_data['related_questions'])}")
+    else:
+        print(f"[S1/SerpAPI] ⚠️ NO related_questions in response")
+    if "ai_overview" in serp_data:
+        aio_keys = list(serp_data["ai_overview"].keys()) if isinstance(serp_data["ai_overview"], dict) else "non-dict"
+        print(f"[S1/SerpAPI] 🤖 ai_overview keys: {aio_keys}")
+    else:
+        print(f"[S1/SerpAPI] ⚠️ NO ai_overview in response")
+    if "answer_box" in serp_data:
+        print(f"[S1/SerpAPI] 📦 answer_box type: {serp_data['answer_box'].get('type', 'unknown')}")
 
-        # ⭐ v27.0 / v54.0: Wyciągnij AI Overview (Google SGE)
-        # SerpAPI może zwrócić pełne dane LUB page_token wymagający drugiego requesta
-        ai_overview = None
-        ai_overview_data = serp_data.get("ai_overview", {})
+    # ── AI Overview (with page_token pagination) ──
+    ai_overview = None
+    ai_overview_data = serp_data.get("ai_overview", {})
 
-        # v54.0: Jeśli SerpAPI zwraca page_token zamiast treści, wykonaj drugi request
-        if ai_overview_data and ai_overview_data.get("page_token") and not ai_overview_data.get("text_blocks"):
-            try:
-                page_token = ai_overview_data["page_token"]
-                print(f"[S1] 🔄 AI Overview requires page_token fetch...")
-                aio_resp = requests.get(
-                    "https://serpapi.com/search.json",
-                    params={
-                        "engine": "google_ai_overview",
-                        "page_token": page_token,
-                        "api_key": SERPAPI_KEY,
-                    },
-                    timeout=15,
-                )
-                if aio_resp.status_code == 200:
-                    ai_overview_data = aio_resp.json().get("ai_overview", ai_overview_data)
-                    print(f"[S1] ✅ AI Overview fetched via page_token")
-                else:
-                    print(f"[S1] ⚠️ AI Overview page_token fetch failed: {aio_resp.status_code}")
-            except Exception as e:
-                print(f"[S1] ⚠️ AI Overview page_token fetch error: {e}")
+    if ai_overview_data and ai_overview_data.get("page_token") and not ai_overview_data.get("text_blocks"):
+        try:
+            page_token = ai_overview_data["page_token"]
+            print(f"[S1/SerpAPI] 🔄 AI Overview requires page_token fetch...")
+            aio_resp = requests.get(
+                "https://serpapi.com/search.json",
+                params={
+                    "engine": "google_ai_overview",
+                    "page_token": page_token,
+                    "api_key": SERPAPI_KEY,
+                },
+                timeout=15,
+            )
+            if aio_resp.status_code == 200:
+                ai_overview_data = aio_resp.json().get("ai_overview", ai_overview_data)
+                print(f"[S1/SerpAPI] ✅ AI Overview fetched via page_token")
+            else:
+                print(f"[S1/SerpAPI] ⚠️ AI Overview page_token fetch failed: {aio_resp.status_code}")
+        except Exception as e:
+            print(f"[S1/SerpAPI] ⚠️ AI Overview page_token error: {e}")
 
-        if ai_overview_data:
-            # v54.0: Wyciągnij tekst z text_blocks (SerpAPI nie ma top-level "text")
-            text_blocks = ai_overview_data.get("text_blocks", [])
-            ai_text_parts = []
-            for block in text_blocks:
-                block_type = block.get("type", "")
-                if block_type in ("paragraph", "heading"):
-                    snippet = block.get("snippet", "")
+    if ai_overview_data:
+        text_blocks = ai_overview_data.get("text_blocks", [])
+        ai_text_parts = []
+        for block in text_blocks:
+            block_type = block.get("type", "")
+            if block_type in ("paragraph", "heading"):
+                snippet = block.get("snippet", "")
+                if snippet:
+                    ai_text_parts.append(snippet)
+            elif block_type == "list":
+                for item in block.get("list", []):
+                    snippet = item.get("snippet", "")
                     if snippet:
-                        ai_text_parts.append(snippet)
-                elif block_type == "list":
-                    for item in block.get("list", []):
-                        snippet = item.get("snippet", "")
-                        if snippet:
-                            ai_text_parts.append(f"- {snippet}")
-                elif block_type == "paragraph_list":
-                    for item in block.get("list", []):
-                        title = item.get("title", "")
-                        snippet = item.get("snippet", "")
-                        if title or snippet:
-                            ai_text_parts.append(f"{title}: {snippet}" if title and snippet else title or snippet)
+                        ai_text_parts.append(f"- {snippet}")
+            elif block_type == "paragraph_list":
+                for item in block.get("list", []):
+                    title = item.get("title", "")
+                    snippet = item.get("snippet", "")
+                    if title or snippet:
+                        ai_text_parts.append(f"{title}: {snippet}" if title and snippet else title or snippet)
 
-            combined_text = ai_overview_data.get("text", "") or "\n".join(ai_text_parts)
+        combined_text = ai_overview_data.get("text", "") or "\n".join(ai_text_parts)
+        references = ai_overview_data.get("references", []) or ai_overview_data.get("sources", [])
 
-            # v54.0: SerpAPI używa "references" (nie "sources") dla cytowań
-            references = ai_overview_data.get("references", []) or ai_overview_data.get("sources", [])
-
+        if combined_text or text_blocks:
             ai_overview = {
                 "text": combined_text,
                 "sources": [
@@ -424,75 +434,168 @@ def fetch_serp_sources(keyword, num_results=10):
                 ],
                 "text_blocks": text_blocks,
             }
-            print(f"[S1] ✅ Found AI Overview ({len(combined_text)} chars, {len(text_blocks)} blocks, {len(references)} refs)")
+            print(f"[S1/SerpAPI] ✅ AI Overview ({len(combined_text)} chars, {len(text_blocks)} blocks)")
 
-        # ⭐ 2. Wyciągnij PAA (People Also Ask)
-        paa_questions = []
-        related_questions = serp_data.get("related_questions", [])
-        for q in related_questions:
-            paa_questions.append({
-                "question": q.get("question", ""),
-                "answer": q.get("snippet", ""),
-                "source": q.get("link", ""),
-                "title": q.get("title", "")
-            })
-        if paa_questions:
-            print(f"[S1] ✅ Found {len(paa_questions)} PAA questions")
-        else:
-            # Fallback: generuj PAA z Claude gdy SerpAPI nie zwróciło related_questions
-            print(f"[S1] ⚠️ No PAA from SerpAPI — generating with Claude fallback...")
-            paa_questions = _generate_paa_claude_fallback(keyword, serp_data)
+    # ── PAA ──
+    paa_questions = []
+    for q in serp_data.get("related_questions", []):
+        paa_questions.append({
+            "question": q.get("question", ""),
+            "answer": q.get("snippet", ""),
+            "source": q.get("link", ""),
+            "title": q.get("title", "")
+        })
+    if paa_questions:
+        print(f"[S1/SerpAPI] ✅ {len(paa_questions)} PAA questions")
+
+    # ── Featured Snippet ──
+    featured_snippet = None
+    answer_box = serp_data.get("answer_box", {})
+    if answer_box:
+        featured_snippet = {
+            "type": answer_box.get("type", "unknown"),
+            "title": answer_box.get("title", ""),
+            "answer": answer_box.get("answer", "") or answer_box.get("snippet", ""),
+            "source": answer_box.get("link", ""),
+            "displayed_link": answer_box.get("displayed_link", "")
+        }
+        print(f"[S1/SerpAPI] ✅ Featured Snippet: {featured_snippet.get('type')}")
+
+    # ── Related Searches ──
+    related_searches = []
+    for rs in serp_data.get("related_searches", []):
+        query = rs.get("query", "")
+        if query:
+            related_searches.append(query)
+    if related_searches:
+        print(f"[S1/SerpAPI] ✅ {len(related_searches)} related searches")
+
+    # ── Organic Results (titles + snippets + URLs for scraping) ──
+    organic_results = serp_data.get("organic_results", [])
+    serp_titles = []
+    serp_snippets = []
+    for result in organic_results:
+        title = result.get("title", "")
+        snippet = result.get("snippet", "")
+        if title:
+            serp_titles.append(title)
+        if snippet:
+            serp_snippets.append(snippet)
+
+    print(f"[S1/SerpAPI] ✅ {len(organic_results)} organic results")
+
+    return {
+        "paa": paa_questions,
+        "featured_snippet": featured_snippet,
+        "ai_overview": ai_overview,
+        "related_searches": related_searches,
+        "serp_titles": serp_titles,
+        "serp_snippets": serp_snippets,
+        "organic_results": organic_results,
+        "_serp_data": serp_data,  # Keep raw data for PAA fallback
+    }
+
+
+def fetch_serp_sources(keyword, num_results=10):
+    """
+    Pobiera PEŁNE dane z Google przez wybranego SERP providera:
+    - Organic results (top 10 stron) + scrapuje ich pełną treść
+    - PAA (People Also Ask)
+    - Featured Snippet
+    - Related Searches
+    - Tytuły i snippety z SERP
+
+    v55.0: Obsługuje DataForSEO (primary) i SerpAPI (fallback)
+    Provider wybierany przez SERP_PROVIDER env var:
+      "dataforseo" — tylko DataForSEO
+      "serpapi"     — tylko SerpAPI
+      "auto"        — DataForSEO jeśli skonfigurowany, fallback do SerpAPI
+    """
+    empty_result = {
+        "sources": [],
+        "paa": [],
+        "featured_snippet": None,
+        "ai_overview": None,
+        "related_searches": [],
+        "serp_titles": [],
+        "serp_snippets": []
+    }
+
+    # ── v55.0: Choose SERP provider ──
+    provider_used = None
+    serp_metadata = None
+
+    try:
+        if SERP_PROVIDER == "dataforseo":
+            if not DATAFORSEO_ENABLED:
+                print("[S1] ❌ SERP_PROVIDER=dataforseo but DataForSEO not configured")
+                return empty_result
+            serp_metadata = dataforseo_fetch(keyword, num_results=num_results)
+            provider_used = "dataforseo"
+
+        elif SERP_PROVIDER == "serpapi":
+            if not SERPAPI_KEY:
+                print("[S1] ❌ SERP_PROVIDER=serpapi but SERPAPI_KEY not set")
+                return empty_result
+            serp_metadata = _fetch_serpapi_data(keyword, num_results=num_results)
+            provider_used = "serpapi"
+
+        else:  # "auto" — try DataForSEO first, fallback to SerpAPI
+            if DATAFORSEO_ENABLED:
+                print(f"[S1] 🔄 Auto-mode: trying DataForSEO first...")
+                serp_metadata = dataforseo_fetch(keyword, num_results=num_results)
+                provider_used = "dataforseo"
+                # Check if DataForSEO returned useful data
+                has_organic = bool(serp_metadata.get("organic_results_raw"))
+                if not has_organic:
+                    print(f"[S1] ⚠️ DataForSEO returned no organic results, falling back to SerpAPI...")
+                    serp_metadata = None
+                    provider_used = None
+
+            if serp_metadata is None and SERPAPI_KEY:
+                print(f"[S1] 🔄 {'Fallback' if DATAFORSEO_ENABLED else 'Using'}: SerpAPI")
+                serp_metadata = _fetch_serpapi_data(keyword, num_results=num_results)
+                provider_used = "serpapi"
+
+        if serp_metadata is None:
+            print("[S1] ❌ No SERP provider available (set SERPAPI_KEY or DATAFORSEO_LOGIN/PASSWORD)")
+            return empty_result
+
+        print(f"[S1] ✅ SERP data from: {provider_used}")
+
+        # ── Extract common fields ──
+        paa_questions = serp_metadata.get("paa", [])
+        featured_snippet = serp_metadata.get("featured_snippet")
+        ai_overview = serp_metadata.get("ai_overview")
+        related_searches = serp_metadata.get("related_searches", [])
+        serp_titles = serp_metadata.get("serp_titles", [])
+        serp_snippets = serp_metadata.get("serp_snippets", [])
+
+        # ── PAA Claude fallback (if no PAA from any provider) ──
+        if not paa_questions:
+            print(f"[S1] ⚠️ No PAA from {provider_used} — generating with Claude fallback...")
+            serp_data_for_fallback = serp_metadata.get("_serp_data", {})
+            paa_questions = _generate_paa_claude_fallback(keyword, serp_data_for_fallback)
             if paa_questions:
                 print(f"[S1] ✅ Claude PAA fallback: {len(paa_questions)} questions generated")
 
-        # ⭐ 3. Wyciągnij Featured Snippet (Answer Box)
-        featured_snippet = None
-        answer_box = serp_data.get("answer_box", {})
-        if answer_box:
-            featured_snippet = {
-                "type": answer_box.get("type", "unknown"),
-                "title": answer_box.get("title", ""),
-                "answer": answer_box.get("answer", "") or answer_box.get("snippet", ""),
-                "source": answer_box.get("link", ""),
-                "displayed_link": answer_box.get("displayed_link", "")
-            }
-            print(f"[S1] ✅ Found Featured Snippet: {featured_snippet.get('type')}")
-
-        # ⭐ 4. Wyciągnij Related Searches
-        related_searches = []
-        for rs in serp_data.get("related_searches", []):
-            query = rs.get("query", "")
-            if query:
-                related_searches.append(query)
-        if related_searches:
-            print(f"[S1] ✅ Found {len(related_searches)} related searches")
-
-        # ⭐ 5. Wyciągnij tytuły i snippety z organic results
-        organic_results = serp_data.get("organic_results", [])
-        serp_titles = []
-        serp_snippets = []
-
-        for result in organic_results:
-            title = result.get("title", "")
-            snippet = result.get("snippet", "")
-            if title:
-                serp_titles.append(title)
-            if snippet:
-                serp_snippets.append(snippet)
+        # ── Get organic results for scraping ──
+        # DataForSEO returns organic_results_raw, SerpAPI returns organic_results
+        organic_results = serp_metadata.get("organic_results") or serp_metadata.get("organic_results_raw", [])
 
         if not organic_results:
-            print("[S1] ⚠️ No organic results from SerpAPI")
+            print(f"[S1] ⚠️ No organic results from {provider_used}")
             return {
                 "sources": [],
                 "paa": paa_questions,
                 "featured_snippet": featured_snippet,
-                "ai_overview": ai_overview,  # v27.0
+                "ai_overview": ai_overview,
                 "related_searches": related_searches,
                 "serp_titles": serp_titles,
                 "serp_snippets": serp_snippets
             }
 
-        print(f"[S1] ✅ Found {len(organic_results)} SERP results")
+        print(f"[S1] ✅ {len(organic_results)} organic results from {provider_used}")
 
         # ⭐ 6. Scrapuj PEŁNĄ treść każdej strony + strukturę H2
         # ⭐ v47.1: Parallel scraping with ThreadPoolExecutor
@@ -625,7 +728,7 @@ def fetch_serp_sources(keyword, num_results=10):
         }
 
     except Exception as e:
-        print(f"[S1] ❌ SerpAPI fetch error: {e}")
+        print(f"[S1] ❌ SERP fetch error ({provider_used or 'unknown'}): {e}")
         return empty_result
 
 # ======================================================
@@ -1057,7 +1160,7 @@ def perform_ngram_analysis():
             "causal_triplets_found": causal_data.get("count", 0) if causal_data else 0,
             "content_gaps_found": content_gaps_data.get("total_gaps", 0) if content_gaps_data else 0,
             "recommended_length": recommended_length,
-            "engine": "v53.0",
+            "engine": "v55.0",
             "lsi_candidates": len(semantic_keyphrases),
         }
     }
@@ -1153,6 +1256,24 @@ def debug_serpapi():
         return jsonify({"error": str(e)}), 500
 
 # ======================================================
+# v55.0: GET /api/debug/dataforseo?keyword=...
+# Diagnostyczny endpoint — zwraca surowy JSON z DataForSEO
+# ======================================================
+@app.route("/api/debug/dataforseo", methods=["GET"])
+def debug_dataforseo():
+    keyword = request.args.get("keyword", "")
+    if not keyword:
+        return jsonify({"error": "Podaj ?keyword=..."}), 400
+    if not DATAFORSEO_ENABLED:
+        return jsonify({"error": "DataForSEO not configured (set DATAFORSEO_LOGIN + DATAFORSEO_PASSWORD)"}), 500
+
+    try:
+        diag = dataforseo_debug(keyword)
+        return jsonify(diag)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ======================================================
 # 🧩 Pozostałe Endpointy (Proxy)
 # ======================================================
 @app.route("/api/synthesize_topics", methods=["POST"])
@@ -1201,7 +1322,7 @@ def handle_exception(e):
 def health():
     return jsonify({
         "status": "ok",
-        "engine": "v53.0",
+        "engine": "v55.0",
         "limits": {
             "max_content_per_page": MAX_CONTENT_SIZE,
             "max_total_content": MAX_TOTAL_CONTENT,
@@ -1211,6 +1332,8 @@ def health():
         "features": {
             "gemini_enabled": bool(GEMINI_API_KEY),
             "serpapi_enabled": bool(SERPAPI_KEY),
+            "dataforseo_enabled": DATAFORSEO_ENABLED,
+            "serp_provider": SERP_PROVIDER,
             "paa_extraction": True,
             "featured_snippet_extraction": True,
             "ai_overview_extraction": True,
