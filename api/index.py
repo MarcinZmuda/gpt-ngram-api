@@ -244,8 +244,9 @@ def _generate_paa_claude_fallback(keyword: str, serp_data: dict) -> list:
     import os as _os, json as _json
     api_key = _os.getenv("ANTHROPIC_API_KEY") or _os.getenv("CLAUDE_API_KEY")
     if not api_key:
-        print("[PAA_FALLBACK] No Anthropic API key")
+        print("[PAA_FALLBACK] ❌ No ANTHROPIC_API_KEY or CLAUDE_API_KEY env var — cannot generate PAA fallback")
         return []
+    print(f"[PAA_FALLBACK] 🔑 Using Anthropic API key ({api_key[:8]}...)")
     try:
         import anthropic as _anthropic
         client = _anthropic.Anthropic(api_key=api_key)
@@ -340,23 +341,89 @@ def fetch_serp_sources(keyword, num_results=10):
 
         serp_data = serp_response.json()
 
-        # ⭐ v27.0: Wyciągnij AI Overview (Google SGE)
+        # v54.0: Debug — loguj klucze SerpAPI response żeby diagnozować brakujące dane
+        serp_keys = list(serp_data.keys())
+        print(f"[S1] 🔑 SerpAPI response keys: {serp_keys}")
+        if "related_questions" in serp_data:
+            print(f"[S1] 📋 related_questions count: {len(serp_data['related_questions'])}")
+        else:
+            print(f"[S1] ⚠️ NO 'related_questions' key in SerpAPI response (PAA unavailable for this query)")
+        if "ai_overview" in serp_data:
+            aio_keys = list(serp_data["ai_overview"].keys()) if isinstance(serp_data["ai_overview"], dict) else "non-dict"
+            print(f"[S1] 🤖 ai_overview keys: {aio_keys}")
+        else:
+            print(f"[S1] ⚠️ NO 'ai_overview' key in SerpAPI response")
+        if "answer_box" in serp_data:
+            print(f"[S1] 📦 answer_box type: {serp_data['answer_box'].get('type', 'unknown')}")
+
+        # ⭐ v27.0 / v54.0: Wyciągnij AI Overview (Google SGE)
+        # SerpAPI może zwrócić pełne dane LUB page_token wymagający drugiego requesta
         ai_overview = None
         ai_overview_data = serp_data.get("ai_overview", {})
+
+        # v54.0: Jeśli SerpAPI zwraca page_token zamiast treści, wykonaj drugi request
+        if ai_overview_data and ai_overview_data.get("page_token") and not ai_overview_data.get("text_blocks"):
+            try:
+                page_token = ai_overview_data["page_token"]
+                print(f"[S1] 🔄 AI Overview requires page_token fetch...")
+                aio_resp = requests.get(
+                    "https://serpapi.com/search.json",
+                    params={
+                        "engine": "google_ai_overview",
+                        "page_token": page_token,
+                        "api_key": SERPAPI_KEY,
+                    },
+                    timeout=15,
+                )
+                if aio_resp.status_code == 200:
+                    ai_overview_data = aio_resp.json().get("ai_overview", ai_overview_data)
+                    print(f"[S1] ✅ AI Overview fetched via page_token")
+                else:
+                    print(f"[S1] ⚠️ AI Overview page_token fetch failed: {aio_resp.status_code}")
+            except Exception as e:
+                print(f"[S1] ⚠️ AI Overview page_token fetch error: {e}")
+
         if ai_overview_data:
+            # v54.0: Wyciągnij tekst z text_blocks (SerpAPI nie ma top-level "text")
+            text_blocks = ai_overview_data.get("text_blocks", [])
+            ai_text_parts = []
+            for block in text_blocks:
+                block_type = block.get("type", "")
+                if block_type in ("paragraph", "heading"):
+                    snippet = block.get("snippet", "")
+                    if snippet:
+                        ai_text_parts.append(snippet)
+                elif block_type == "list":
+                    for item in block.get("list", []):
+                        snippet = item.get("snippet", "")
+                        if snippet:
+                            ai_text_parts.append(f"- {snippet}")
+                elif block_type == "paragraph_list":
+                    for item in block.get("list", []):
+                        title = item.get("title", "")
+                        snippet = item.get("snippet", "")
+                        if title or snippet:
+                            ai_text_parts.append(f"{title}: {snippet}" if title and snippet else title or snippet)
+
+            combined_text = ai_overview_data.get("text", "") or "\n".join(ai_text_parts)
+
+            # v54.0: SerpAPI używa "references" (nie "sources") dla cytowań
+            references = ai_overview_data.get("references", []) or ai_overview_data.get("sources", [])
+
             ai_overview = {
-                "text": ai_overview_data.get("text", "") or ai_overview_data.get("snippet", ""),
+                "text": combined_text,
                 "sources": [
                     {
-                        "title": src.get("title", ""),
-                        "link": src.get("link", ""),
-                        "snippet": src.get("snippet", "")
+                        "title": ref.get("title", ""),
+                        "link": ref.get("link", ""),
+                        "snippet": ref.get("snippet", ""),
+                        "index": ref.get("index", None),
                     }
-                    for src in ai_overview_data.get("sources", [])[:5]
+                    for ref in references[:5]
                 ],
-                "text_blocks": ai_overview_data.get("text_blocks", [])
+                "text_blocks": text_blocks,
             }
-            print(f"[S1] ✅ Found AI Overview ({len(ai_overview.get('text', ''))} chars)")
+            print(f"[S1] ✅ Found AI Overview ({len(combined_text)} chars, {len(text_blocks)} blocks, {len(references)} refs)")
 
         # ⭐ 2. Wyciągnij PAA (People Also Ask)
         paa_questions = []
