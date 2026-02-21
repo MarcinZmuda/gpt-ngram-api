@@ -1098,6 +1098,60 @@ def perform_s1_analysis():
     return perform_ngram_analysis()
 
 # ======================================================
+# v54.0: GET /api/debug/serpapi?keyword=...
+# Diagnostyczny endpoint — zwraca surowy JSON z SerpAPI
+# żeby zobaczyć co dokładnie przychodzi (PAA, AI Overview, etc.)
+# ======================================================
+@app.route("/api/debug/serpapi", methods=["GET"])
+def debug_serpapi():
+    keyword = request.args.get("keyword", "")
+    if not keyword:
+        return jsonify({"error": "Podaj ?keyword=..."}), 400
+    if not SERPAPI_KEY:
+        return jsonify({"error": "SERPAPI_KEY not configured"}), 500
+
+    try:
+        resp = requests.get(
+            "https://serpapi.com/search",
+            params={
+                "q": keyword,
+                "api_key": SERPAPI_KEY,
+                "num": 8,
+                "hl": "pl",
+                "gl": "pl",
+                "no_cache": "true",
+            },
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            return jsonify({"error": f"SerpAPI HTTP {resp.status_code}", "body": resp.text[:500]}), 502
+
+        raw = resp.json()
+
+        # Zwróć diagnostykę — surowe klucze + interesujące sekcje
+        diag = {
+            "keyword": keyword,
+            "all_keys": list(raw.keys()),
+            "has_related_questions": "related_questions" in raw,
+            "related_questions_count": len(raw.get("related_questions", [])),
+            "related_questions": raw.get("related_questions", []),
+            "has_ai_overview": "ai_overview" in raw,
+            "ai_overview_keys": list(raw["ai_overview"].keys()) if isinstance(raw.get("ai_overview"), dict) else None,
+            "ai_overview_has_page_token": bool(raw.get("ai_overview", {}).get("page_token")) if isinstance(raw.get("ai_overview"), dict) else False,
+            "ai_overview": raw.get("ai_overview"),
+            "has_answer_box": "answer_box" in raw,
+            "answer_box": raw.get("answer_box"),
+            "has_related_searches": "related_searches" in raw,
+            "related_searches": raw.get("related_searches", []),
+            "organic_results_count": len(raw.get("organic_results", [])),
+            "organic_titles": [r.get("title", "") for r in raw.get("organic_results", [])[:5]],
+        }
+        return jsonify(diag)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ======================================================
 # 🧩 Pozostałe Endpointy (Proxy)
 # ======================================================
 @app.route("/api/synthesize_topics", methods=["POST"])
