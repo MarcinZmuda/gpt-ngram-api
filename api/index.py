@@ -795,6 +795,8 @@ def perform_ngram_analysis():
           f"x{unique_h2_patterns[0]['count'] if unique_h2_patterns else 0})")
 
     # ⭐ Przygotuj serp_analysis
+    # v53.0: Standaryzacja — competitors zawiera title, snippet, url
+    # Mapowanie snippet do competitor na podstawie pozycji w SERP
     serp_analysis_data = {
         "paa_questions": paa_questions,
         "featured_snippet": featured_snippet,
@@ -803,16 +805,39 @@ def perform_ngram_analysis():
         "competitor_titles": serp_titles[:10],
         "competitor_snippets": serp_snippets[:10],
         "competitor_h2_patterns": unique_h2_patterns,
-        # v27.0: Dodaj competitors z word_count dla recommended_length
+        # v53.0: competitors z title, snippet, url, word_count, h2_count
         "competitors": [
             {
                 "url": src.get("url", ""),
                 "title": src.get("title", ""),
+                "snippet": serp_snippets[i] if i < len(serp_snippets) else "",
                 "word_count": src.get("word_count", 0),
                 "h2_count": len(src.get("h2_structure", []))
             }
-            for src in sources
+            for i, src in enumerate(sources)
         ]
+    }
+
+    # v53.0: Analiza długości — recommended_length na podstawie competitors
+    word_counts = [src.get("word_count", 0) for src in sources if src.get("word_count", 0) > 0]
+    if word_counts:
+        avg_word_count = int(sum(word_counts) / len(word_counts))
+        median_idx = len(word_counts) // 2
+        sorted_wc = sorted(word_counts)
+        median_word_count = sorted_wc[median_idx] if len(sorted_wc) % 2 == 1 else (sorted_wc[median_idx - 1] + sorted_wc[median_idx]) // 2
+        recommended_length = int(avg_word_count * 1.1)  # 10% więcej niż średnia
+    else:
+        avg_word_count = 0
+        median_word_count = 0
+        recommended_length = 0
+
+    length_analysis = {
+        "recommended": recommended_length,
+        "avg_competitor": avg_word_count,
+        "median_competitor": median_word_count,
+        "min_competitor": min(word_counts) if word_counts else 0,
+        "max_competitor": max(word_counts) if word_counts else 0,
+        "competitors_count": len(word_counts),
     }
 
     # 3️⃣ Content Hints - WYŁĄCZONE v28.0 (duplikuje dane z serp_analysis)
@@ -843,10 +868,31 @@ def perform_ngram_analysis():
                 texts=[s.get("content", "") for s in sources],
                 main_keyword=main_keyword
             )
+            # v53.0: Standaryzacja — chains zawierają cause/mechanism/effect,
+            # singles zawierają cause/effect (bez mechanism)
+            causal_chains = []
+            for t in causal_triplets:
+                if t.is_chain:
+                    causal_chains.append({
+                        "cause": t.cause,
+                        "mechanism": t.relation_type,
+                        "effect": t.effect,
+                        "confidence": t.confidence,
+                        "source_sentence": t.source_sentence,
+                    })
+            causal_singles = []
+            for t in causal_triplets:
+                if not t.is_chain:
+                    causal_singles.append({
+                        "cause": t.cause,
+                        "effect": t.effect,
+                        "confidence": t.confidence,
+                        "source_sentence": t.source_sentence,
+                    })
             causal_data = {
                 "count": len(causal_triplets),
-                "chains": [t.to_dict() for t in causal_triplets if t.is_chain],
-                "singles": [t.to_dict() for t in causal_triplets if not t.is_chain],
+                "chains": causal_chains,
+                "singles": causal_singles,
                 "agent_instruction": format_causal_for_agent(causal_triplets, main_keyword)
             }
             print(f"[S1] ✅ Causal Triplets: {len(causal_triplets)} found "
@@ -860,19 +906,43 @@ def perform_ngram_analysis():
     if GAP_ANALYZER_ENABLED and sources:
         try:
             print(f"[S1] 📊 Running Gap Analysis...")
-            content_gaps_data = analyze_content_gaps(
+            # v53.0: Przekaż H2 jako listę stringów (gap_analyzer oczekuje list of str)
+            h2_texts = [
+                p.get("text", "") if isinstance(p, dict) else str(p)
+                for p in unique_h2_patterns
+            ]
+            raw_gaps = analyze_content_gaps(
                 competitor_texts=[s.get("content", "") for s in sources],
-                competitor_h2s=unique_h2_patterns,
+                competitor_h2s=h2_texts,
                 paa_questions=paa_questions,
                 related_searches=related_searches,
                 main_keyword=main_keyword
             )
+            # v53.0: Standaryzacja — dodaj flat string lists obok pełnych obiektów
+            content_gaps_data = {
+                "total_gaps": raw_gaps.get("total_gaps", 0),
+                "suggested_new_h2s": raw_gaps.get("suggested_new_h2s", []),
+                "paa_unanswered": [
+                    g.get("topic", "") for g in raw_gaps.get("paa_unanswered", [])
+                ],
+                "subtopic_missing": [
+                    g.get("topic", "") for g in raw_gaps.get("subtopic_missing", [])
+                ],
+                "depth_missing": [
+                    g.get("topic", "") for g in raw_gaps.get("depth_missing", [])
+                ],
+                "instruction": raw_gaps.get("agent_instruction", ""),
+                # Zachowaj pełne obiekty dla kompatybilności
+                "all_gaps": raw_gaps.get("all_gaps", []),
+                "status": raw_gaps.get("status", "OK"),
+            }
             print(f"[S1] ✅ Content Gaps: {content_gaps_data.get('total_gaps', 0)} gaps found")
         except Exception as e:
             print(f"[S1] ⚠️ Gap Analysis error (non-critical): {e}")
             content_gaps_data = {"error": str(e), "status": "FAILED"}
 
     # ⭐ PEŁNA ODPOWIEDŹ z wszystkimi danymi SERP
+    # v53.0: Standaryzacja — ujednolicone pola, aliasy dla kompatybilności
     response_payload = {
         "main_keyword": main_keyword,
         "ngrams": results,
@@ -887,16 +957,23 @@ def perform_ngram_analysis():
         # ⭐ Pełna analiza SERP (surowe dane)
         "serp_analysis": serp_analysis_data,
 
-        # ⭐ Content Hints - WYŁĄCZONE v28.0 (BRAJEN używa serp_analysis bezpośrednio)
-        # "content_hints": content_hints,
+        # v53.0: Top-level PAA alias (ZAWSZE obecny, wskazuje na serp_analysis.paa_questions)
+        "paa": paa_questions,
+
+        # v53.0: Analiza długości (recommended_length + dane kompetytorów)
+        "length_analysis": length_analysis,
+        "recommended_length": recommended_length,
+
+        # v53.0: Top-level H2 patterns alias
+        "competitor_h2_patterns": unique_h2_patterns,
 
         # 🆕 Entity SEO (v28.0)
         "entity_seo": entity_seo_data,
 
-        # 🆕 Causal Triplets (v45.0)
+        # 🆕 Causal Triplets (v45.0, v53.0: standaryzacja chains/singles)
         "causal_triplets": causal_data,
 
-        # 🆕 Content Gaps (v45.0)
+        # 🆕 Content Gaps (v45.0, v53.0: flat string lists + instruction)
         "content_gaps": content_gaps_data,
 
         "summary": {
@@ -911,7 +988,8 @@ def perform_ngram_analysis():
             "entities_found": entity_seo_data.get("entity_seo_summary", {}).get("total_entities", 0) if entity_seo_data else 0,
             "causal_triplets_found": causal_data.get("count", 0) if causal_data else 0,
             "content_gaps_found": content_gaps_data.get("total_gaps", 0) if content_gaps_data else 0,
-            "engine": "v28.0",
+            "recommended_length": recommended_length,
+            "engine": "v53.0",
             "lsi_candidates": len(semantic_keyphrases),
         }
     }
@@ -944,6 +1022,15 @@ def perform_ngram_analysis():
     return jsonify(response_payload)
 
 # ======================================================
+# v53.0: /api/s1_analysis — Alias for /api/ngram_entity_analysis
+# Frontend oczekuje tego endpointu pod tą nazwą
+# ======================================================
+@app.route("/api/s1_analysis", methods=["POST"])
+def perform_s1_analysis():
+    """Alias — deleguje do perform_ngram_analysis."""
+    return perform_ngram_analysis()
+
+# ======================================================
 # 🧩 Pozostałe Endpointy (Proxy)
 # ======================================================
 @app.route("/api/synthesize_topics", methods=["POST"])
@@ -962,11 +1049,578 @@ def perform_generate_compliance_report():
     data = request.get_json(force=True)
     return jsonify(generate_compliance_report(data.get("text", ""), data.get("keyword_state", {})))
 
+# ======================================================
+# v53.0: POST /api/ymyl/detect_and_enrich
+# Detekcja kategorii YMYL + enrichment danymi medycznymi/prawnymi
+# ZAWSZE zwraca JSON, nigdy HTML
+# ======================================================
+@app.route("/api/ymyl/detect_and_enrich", methods=["POST"])
+def ymyl_detect_and_enrich():
+    try:
+        data = request.get_json(force=True)
+        keyword = data.get("keyword", "") or data.get("main_keyword", "")
+        text = data.get("text", "")
+
+        if not keyword and not text:
+            return jsonify({"error": "Brak keyword lub text do analizy YMYL", "fallback": True}), 400
+
+        content_to_analyze = (keyword + " " + text[:5000]).strip().lower()
+
+        # Detekcja kategorii YMYL na podstawie keyword heurystyk
+        detected_category = "none"
+        is_ymyl = False
+        ymyl_intensity = "none"
+
+        # Wzorce prawne
+        legal_patterns = [
+            r'\b(kodeks|ustawa|prawo|artykuł|art\.|sąd|wyrok|kara|grzywna|mandat|'
+            r'przestępstwo|wykroczenie|alimenty|rozwód|spadek|umowa|odszkodowanie|'
+            r'pozew|apelacja|kasacja|egzekucja|komornik|adwokat|radca)\b'
+        ]
+        # Wzorce medyczne
+        medical_patterns = [
+            r'\b(leczenie|choroba|lek|tabletk[ai]|objaw[iy]?|diagnoza|'
+            r'operacja|zabieg|szpital|lekarz|dawkowanie|skutki uboczne|'
+            r'terapia|rehabilitacja|badani[ae]|szczepieni[ae]|antybiotyk|'
+            r'ciąża|nowotwór|rak|cukrzyca|nadciśnienie)\b'
+        ]
+        # Wzorce finansowe
+        finance_patterns = [
+            r'\b(kredyt|pożyczka|hipoteka|inwestycj[ae]|podatek|pit|vat|'
+            r'emerytura|ubezpieczeni[ae]|konto|bank|giełda|akcje|'
+            r'oprocentowanie|rata|zdolność kredytowa|ofe|zus|ppk)\b'
+        ]
+
+        legal_score = sum(
+            len(re.findall(p, content_to_analyze))
+            for p in legal_patterns
+        )
+        medical_score = sum(
+            len(re.findall(p, content_to_analyze))
+            for p in medical_patterns
+        )
+        finance_score = sum(
+            len(re.findall(p, content_to_analyze))
+            for p in finance_patterns
+        )
+
+        max_score = max(legal_score, medical_score, finance_score)
+
+        if max_score >= 3:
+            is_ymyl = True
+            ymyl_intensity = "full" if max_score >= 5 else "light"
+            if legal_score == max_score:
+                detected_category = "legal"
+            elif medical_score == max_score:
+                detected_category = "medical"
+            else:
+                detected_category = "finance"
+
+        response = {
+            "detected_category": detected_category,
+            "is_ymyl": is_ymyl,
+            "ymyl_intensity": ymyl_intensity,
+            "enrichment_method": "ngram_api_heuristic",
+            "scores": {
+                "legal": legal_score,
+                "medical": medical_score,
+                "finance": finance_score,
+            },
+        }
+
+        # Enrichment na podstawie kategorii
+        if detected_category == "legal":
+            # Ekstrakcja artykułów prawnych z tekstu
+            articles = re.findall(
+                r'art(?:ykuł)?\.?\s*\d+[a-z]?(?:\s*§\s*\d+)?(?:\s*(?:k\.\s*[a-zł]+\.?|[Kk]odeks[u]?\s+\w+))?',
+                text, re.IGNORECASE
+            )
+            response["legal"] = {
+                "articles": list(set(a.strip() for a in articles))[:20],
+                "search_queries": [
+                    f"{keyword} orzecznictwo",
+                    f"{keyword} wyrok sądu",
+                    f"{keyword} kodeks",
+                ],
+            }
+        elif detected_category == "medical":
+            response["medical"] = {
+                "mesh_terms": [],
+                "condition_en": "",
+                "specialization": "",
+                "key_drugs": [],
+            }
+        elif detected_category == "finance":
+            response["finance"] = {
+                "regulations": [],
+                "key_terms": [],
+            }
+
+        return jsonify(response)
+
+    except Exception as e:
+        print(f"[YMYL] Error: {e}")
+        return jsonify({
+            "error": str(e),
+            "fallback": True,
+            "detected_category": "none",
+            "is_ymyl": False,
+            "ymyl_intensity": "none",
+        }), 500
+
+# ======================================================
+# v53.0: POST /api/legal/get_context
+# Pobieranie kontekstu prawnego (orzecznictwa, akty prawne)
+# Standaryzacja: ZAWSZE signature, court, date, summary, type
+# ======================================================
+@app.route("/api/legal/get_context", methods=["POST"])
+def legal_get_context():
+    try:
+        data = request.get_json(force=True)
+        keyword = data.get("keyword", "") or data.get("main_keyword", "")
+        articles = data.get("articles", [])
+
+        if not keyword:
+            return jsonify({"error": "Brak keyword"}), 400
+
+        # Ekstrakcja artykułów z keyword jeśli nie podane
+        if not articles:
+            found = re.findall(
+                r'art(?:ykuł)?\.?\s*\d+[a-z]?(?:\s*§\s*\d+)?(?:\s*(?:k\.\s*[a-zł]+\.?|[Kk]odeks[u]?\s+\w+))?',
+                keyword, re.IGNORECASE
+            )
+            articles = [a.strip() for a in found]
+
+        # v53.0: Standaryzowane nazwy pól:
+        # ZAWSZE: signature, court, date, summary, type
+        # + opcjonalne aliasy: caseNumber=signature, courtName=court,
+        #   judgmentDate=date, excerpt=summary, judgmentType=type
+        response = {
+            "keyword": keyword,
+            "legal_acts": articles,
+            "top_judgments": [],
+            "legal_instruction": "",
+            "status": "OK" if articles else "NO_ARTICLES_FOUND",
+        }
+
+        # Jeśli mamy artykuły, próbujemy pobrać orzecznictwo z API sądów
+        if articles:
+            judgments = _fetch_judgments(keyword, articles)
+            response["top_judgments"] = judgments
+            response["legal_instruction"] = _format_legal_instruction(keyword, articles, judgments)
+
+        return jsonify(response)
+
+    except Exception as e:
+        print(f"[LEGAL] Error: {e}")
+        return jsonify({
+            "error": str(e),
+            "keyword": data.get("keyword", "") if 'data' in dir() else "",
+            "legal_acts": [],
+            "top_judgments": [],
+            "legal_instruction": "",
+            "status": "ERROR",
+        }), 500
+
+
+def _fetch_judgments(keyword, articles, max_results=5):
+    """
+    Pobiera orzecznictwo z API Sądów RP (orzeczenia.ms.gov.pl).
+    v53.0: Standaryzowane pola: signature, court, date, summary, type
+    """
+    judgments = []
+    try:
+        # Szukaj po keyword w Saos API
+        search_query = keyword[:100]
+        resp = requests.get(
+            "https://www.saos.org.pl/api/search/judgments",
+            params={
+                "all": search_query,
+                "pageSize": max_results,
+                "sortingField": "JUDGMENT_DATE",
+                "sortingDirection": "DESC",
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            items = data.get("items", [])
+            for item in items[:max_results]:
+                # v53.0: Standaryzowane nazwy pól
+                judgment = {
+                    "signature": item.get("courtCases", [{}])[0].get("caseNumber", "") if item.get("courtCases") else "",
+                    "court": item.get("courtName", "") or (item.get("division", {}) or {}).get("court", {}).get("name", ""),
+                    "date": item.get("judgmentDate", ""),
+                    "summary": (item.get("textContent", "") or "")[:500],
+                    "type": item.get("judgmentType", ""),
+                    # Aliasy dla kompatybilności wstecznej
+                    "caseNumber": item.get("courtCases", [{}])[0].get("caseNumber", "") if item.get("courtCases") else "",
+                    "courtName": item.get("courtName", "") or (item.get("division", {}) or {}).get("court", {}).get("name", ""),
+                    "judgmentDate": item.get("judgmentDate", ""),
+                    "excerpt": (item.get("textContent", "") or "")[:500],
+                    "judgmentType": item.get("judgmentType", ""),
+                }
+                judgments.append(judgment)
+            print(f"[LEGAL] Found {len(judgments)} judgments for '{keyword}'")
+    except Exception as e:
+        print(f"[LEGAL] Judgment fetch error: {e}")
+
+    return judgments
+
+
+def _format_legal_instruction(keyword, articles, judgments):
+    """Formatuje instrukcję prawną dla agenta."""
+    lines = [f"Kontekst prawny dla \"{keyword}\":"]
+    if articles:
+        lines.append(f"Powiązane przepisy: {', '.join(articles[:10])}")
+    if judgments:
+        lines.append(f"Znaleziono {len(judgments)} orzeczeń sądowych.")
+        for j in judgments[:3]:
+            sig = j.get("signature", "")
+            court = j.get("court", "")
+            if sig:
+                lines.append(f"  - {sig} ({court})")
+    return "\n".join(lines)
+
+
+# ======================================================
+# v53.0: POST /api/medical/get_context
+# Pobieranie kontekstu medycznego (publikacje, wytyczne)
+# MUSI zwrócić poprawny JSON nawet przy braku danych PubMed
+# Standaryzacja: ZAWSZE evidence_level, study_type
+# ======================================================
+@app.route("/api/medical/get_context", methods=["POST"])
+def medical_get_context():
+    try:
+        data = request.get_json(force=True)
+        keyword = data.get("keyword", "") or data.get("main_keyword", "")
+        condition_en = data.get("condition_en", "")
+
+        if not keyword:
+            return jsonify({"error": "Brak keyword"}), 400
+
+        # Próbuj pobrać publikacje z PubMed
+        publications = []
+        search_term = condition_en or keyword
+
+        try:
+            publications = _fetch_pubmed(search_term, max_results=5)
+        except Exception as e:
+            print(f"[MEDICAL] PubMed fetch error (non-fatal): {e}")
+
+        # v53.0: Standaryzowane pola: evidence_level, study_type
+        # (NIGDY: level, type — te nazwy mogą kolidować z wbudowanymi)
+        standardized_pubs = []
+        for pub in publications:
+            standardized_pubs.append({
+                "title": pub.get("title", ""),
+                "authors": pub.get("authors", ""),
+                "journal": pub.get("journal", ""),
+                "year": pub.get("year", ""),
+                "pmid": pub.get("pmid", ""),
+                "evidence_level": pub.get("evidence_level", "") or pub.get("level", ""),
+                "study_type": pub.get("study_type", "") or pub.get("type", ""),
+                "abstract_snippet": pub.get("abstract_snippet", ""),
+            })
+
+        response = {
+            "keyword": keyword,
+            "top_publications": standardized_pubs,
+            "medical_instruction": _format_medical_instruction(keyword, standardized_pubs),
+            "guidelines": [],
+            "status": "OK" if standardized_pubs else "NO_PUBLICATIONS_FOUND",
+        }
+
+        return jsonify(response)
+
+    except Exception as e:
+        print(f"[MEDICAL] Error: {e}")
+        # v53.0: ZAWSZE zwraca poprawny JSON, nigdy timeout/500 bez body
+        return jsonify({
+            "error": str(e),
+            "keyword": data.get("keyword", "") if 'data' in dir() else "",
+            "top_publications": [],
+            "medical_instruction": "",
+            "guidelines": [],
+            "status": "ERROR",
+        }), 500
+
+
+def _fetch_pubmed(search_term, max_results=5):
+    """
+    Pobiera publikacje z PubMed E-utilities API.
+    Timeout: 15s (zamiast 5s).
+    """
+    publications = []
+    try:
+        # Krok 1: Szukaj ID
+        search_resp = requests.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+            params={
+                "db": "pubmed",
+                "term": search_term,
+                "retmax": max_results,
+                "sort": "relevance",
+                "retmode": "json",
+            },
+            timeout=15,
+        )
+        if search_resp.status_code != 200:
+            return []
+
+        search_data = search_resp.json()
+        id_list = search_data.get("esearchresult", {}).get("idlist", [])
+
+        if not id_list:
+            return []
+
+        # Krok 2: Pobierz szczegóły
+        summary_resp = requests.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+            params={
+                "db": "pubmed",
+                "id": ",".join(id_list),
+                "retmode": "json",
+            },
+            timeout=15,
+        )
+        if summary_resp.status_code != 200:
+            return []
+
+        summary_data = summary_resp.json()
+        results = summary_data.get("result", {})
+
+        for pmid in id_list:
+            article = results.get(pmid, {})
+            if not article or pmid == "uids":
+                continue
+
+            # Heurystyka study_type na podstawie tytułu
+            title = article.get("title", "")
+            title_lower = title.lower()
+            study_type = "unknown"
+            evidence_level = ""
+
+            if "meta-analysis" in title_lower or "meta analysis" in title_lower:
+                study_type = "meta-analysis"
+                evidence_level = "I"
+            elif "systematic review" in title_lower:
+                study_type = "systematic review"
+                evidence_level = "I"
+            elif "randomized" in title_lower or "randomised" in title_lower:
+                study_type = "RCT"
+                evidence_level = "II"
+            elif "cohort" in title_lower:
+                study_type = "cohort study"
+                evidence_level = "III"
+            elif "case" in title_lower and "control" in title_lower:
+                study_type = "case-control"
+                evidence_level = "III"
+            elif "review" in title_lower:
+                study_type = "review"
+                evidence_level = "IV"
+
+            publications.append({
+                "title": title,
+                "authors": ", ".join(a.get("name", "") for a in (article.get("authors", []) or [])[:3]),
+                "journal": article.get("fulljournalname", "") or article.get("source", ""),
+                "year": article.get("pubdate", "")[:4],
+                "pmid": pmid,
+                "evidence_level": evidence_level,
+                "study_type": study_type,
+                "abstract_snippet": "",
+            })
+
+        print(f"[MEDICAL] Found {len(publications)} publications for '{search_term}'")
+
+    except requests.exceptions.Timeout:
+        print(f"[MEDICAL] PubMed timeout for '{search_term}'")
+    except Exception as e:
+        print(f"[MEDICAL] PubMed error: {e}")
+
+    return publications
+
+
+def _format_medical_instruction(keyword, publications):
+    """Formatuje instrukcję medyczną dla agenta."""
+    if not publications:
+        return ""
+    lines = [f"Kontekst medyczny dla \"{keyword}\":"]
+    lines.append(f"Znaleziono {len(publications)} publikacji naukowych.")
+    for pub in publications[:3]:
+        title = pub.get("title", "")[:100]
+        journal = pub.get("journal", "")
+        year = pub.get("year", "")
+        level = pub.get("evidence_level", "")
+        level_info = f" [Level {level}]" if level else ""
+        lines.append(f"  - {title} ({journal}, {year}){level_info}")
+    return "\n".join(lines)
+
+
+# ======================================================
+# v53.0: GET /api/project/<id>/final_review
+# Standaryzacja: ZAWSZE bezpośredni format (bez wrappera)
+# Pola: quality_score, humanness_score, density, word_count
+# + quality_breakdown dla radar chart
+# ======================================================
+@app.route("/api/project/<project_id>/final_review", methods=["GET"])
+def get_final_review(project_id):
+    try:
+        db = firestore.client()
+        doc_ref = db.collection("seo_projects").document(project_id)
+        doc = doc_ref.get()
+
+        if not doc.exists:
+            return jsonify({"error": f"Projekt {project_id} nie istnieje"}), 404
+
+        project_data = doc.to_dict()
+        review = project_data.get("final_review", {})
+
+        if not review:
+            return jsonify({"error": "Brak final_review dla tego projektu", "project_id": project_id}), 404
+
+        # v53.0: Standaryzacja — ZAWSZE te same nazwy pól, bez wrappera
+        # Ujednolicenie aliasów:
+        #   quality_score (nie "score")
+        #   humanness_score (nie "ai_score")
+        #   density (nie "keyword_density")
+        #   word_count (nie "total_words")
+        quality_score = review.get("quality_score") or review.get("score", 0)
+        humanness_score = review.get("humanness_score") or review.get("ai_score", 0)
+        density = review.get("density") or review.get("keyword_density", 0)
+        word_count = review.get("word_count") or review.get("total_words", 0)
+
+        # Wyciągnij poszczególne score'y do quality_breakdown
+        keyword_score = review.get("keyword_score", quality_score)
+        grammar_score = review.get("grammar_score", 0)
+        structure_score = review.get("structure_score", 0)
+        semantic_score = review.get("semantic_score", 0)
+        depth_score = review.get("depth_score", 0)
+        coherence_score = review.get("coherence_score", 0)
+
+        response = {
+            "project_id": project_id,
+            "quality_score": quality_score,
+            "humanness_score": humanness_score,
+            "density": density,
+            "word_count": word_count,
+            # v53.0: quality_breakdown dla radar chart
+            "quality_breakdown": {
+                "keywords": keyword_score,
+                "humanness": humanness_score,
+                "grammar": grammar_score,
+                "structure": structure_score,
+                "semantic": semantic_score,
+                "depth": depth_score,
+                "coherence": coherence_score,
+            },
+            # Zachowaj dodatkowe pola z review
+            "suggestions": review.get("suggestions", []),
+            "status": "OK",
+        }
+
+        return jsonify(response)
+
+    except Exception as e:
+        print(f"[FINAL_REVIEW] Error: {e}")
+        return jsonify({"error": str(e), "project_id": project_id}), 500
+
+
+# ======================================================
+# v53.0: GET /api/project/<id>/pre_batch_info
+# SERP enrichment per batch: PAA, LSI keywords, causal context
+# ======================================================
+@app.route("/api/project/<project_id>/pre_batch_info", methods=["GET"])
+def get_pre_batch_info(project_id):
+    try:
+        db = firestore.client()
+        doc_ref = db.collection("seo_projects").document(project_id)
+        doc = doc_ref.get()
+
+        if not doc.exists:
+            return jsonify({"error": f"Projekt {project_id} nie istnieje"}), 404
+
+        project_data = doc.to_dict()
+        s1_data = project_data.get("s1_data", {})
+
+        # Wyciągnij dane z s1_data (zapisane przez /api/ngram_entity_analysis)
+        serp_analysis = s1_data.get("serp_analysis", {})
+        paa_questions = serp_analysis.get("paa_questions", [])
+        related_searches = serp_analysis.get("related_searches", [])
+        semantic_keyphrases = s1_data.get("semantic_keyphrases", [])
+        causal_data = s1_data.get("causal_triplets", {})
+        content_gaps = s1_data.get("content_gaps", {})
+
+        # v53.0: SERP enrichment per batch
+        lsi_keywords = [
+            kp.get("phrase", "") for kp in semantic_keyphrases
+            if isinstance(kp, dict) and kp.get("phrase")
+        ]
+
+        paa_for_batch = [
+            q.get("question", "") for q in paa_questions
+            if isinstance(q, dict) and q.get("question")
+        ]
+
+        # Causal context string
+        causal_context = causal_data.get("agent_instruction", "") if isinstance(causal_data, dict) else ""
+
+        # Information gain from content gaps
+        information_gain = content_gaps.get("instruction", "") if isinstance(content_gaps, dict) else ""
+
+        response = {
+            "project_id": project_id,
+            "main_keyword": s1_data.get("main_keyword", ""),
+            "serp_enrichment": {
+                "paa_for_batch": paa_for_batch,
+                "lsi_keywords": lsi_keywords,
+            },
+            "enhanced": {
+                "causal_context": causal_context,
+                "information_gain": information_gain,
+                "paa_from_serp": paa_for_batch,
+            },
+            "status": "OK",
+        }
+
+        return jsonify(response)
+
+    except Exception as e:
+        print(f"[PRE_BATCH] Error: {e}")
+        return jsonify({"error": str(e), "project_id": project_id}), 500
+
+
+# ======================================================
+# v53.0: Global JSON Error Handlers
+# NIGDY nie zwracaj HTML error pages — ZAWSZE Content-Type: application/json
+# ======================================================
+@app.errorhandler(400)
+def handle_400(e):
+    return jsonify({"error": "Bad Request", "details": str(e)}), 400
+
+@app.errorhandler(404)
+def handle_404(e):
+    return jsonify({"error": "Not Found", "details": str(e)}), 404
+
+@app.errorhandler(405)
+def handle_405(e):
+    return jsonify({"error": "Method Not Allowed", "details": str(e)}), 405
+
+@app.errorhandler(500)
+def handle_500(e):
+    return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    print(f"[ERROR] Unhandled exception: {e}")
+    return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
-        "engine": "v28.0",
+        "engine": "v53.0",
         "limits": {
             "max_content_per_page": MAX_CONTENT_SIZE,
             "max_total_content": MAX_TOTAL_CONTENT,
@@ -995,6 +1649,14 @@ def health():
             # v45.0: Causal Triplets + Gap Analysis
             "causal_triplets_enabled": CAUSAL_EXTRACTOR_ENABLED,
             "gap_analysis_enabled": GAP_ANALYZER_ENABLED,
+            # v53.0: Nowe endpointy
+            "s1_analysis_alias": True,
+            "ymyl_detection": True,
+            "legal_context": True,
+            "medical_context": True,
+            "final_review": True,
+            "pre_batch_info": True,
+            "json_error_handlers": True,
         }
     })
 
