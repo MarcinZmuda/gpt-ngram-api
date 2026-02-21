@@ -444,6 +444,9 @@ def analyze_topical_coverage(
     topic_groups = defaultdict(lambda: {"count": 0, "examples": []})
     
     for h2 in h2_patterns:
+        # h2 may be a dict {"text": ..., "count": ...} or a plain string
+        if isinstance(h2, dict):
+            h2 = h2.get("text", "")
         h2_clean = h2.lower().strip()
         if not h2_clean or len(h2_clean) < 5:
             continue

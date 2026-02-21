@@ -172,6 +172,36 @@ def _normalize_chunk(text: str) -> str:
     return text
 
 
+def _pos_noun_chunks(doc):
+    """
+    Fallback for languages without noun_chunks (e.g. Polish).
+    Builds noun-phrase spans from POS tags: sequences of ADJ/NOUN/PROPN
+    ending in NOUN or PROPN, length 2-5 tokens.
+    Returns list of spaCy Span objects (same interface as doc.noun_chunks).
+    """
+    _NP_POS = {"NOUN", "PROPN", "ADJ"}
+    spans = []
+    start = None
+    for i, token in enumerate(doc):
+        if token.pos_ in _NP_POS and not token.is_stop:
+            if start is None:
+                start = i
+        else:
+            if start is not None:
+                end = i
+                length = end - start
+                if 2 <= length <= 5 and doc[end - 1].pos_ in {"NOUN", "PROPN"}:
+                    spans.append(doc[start:end])
+                start = None
+    # handle tail
+    if start is not None:
+        end = len(doc)
+        length = end - start
+        if 2 <= length <= 5 and doc[end - 1].pos_ in {"NOUN", "PROPN"}:
+            spans.append(doc[start:end])
+    return spans
+
+
 def _get_lemma_key(doc_chunk) -> str:
     """
     Tworzy klucz lemmatyzacyjny z noun chunka.
@@ -268,8 +298,15 @@ def extract_topical_entities(
         
         try:
             doc = nlp(text_sample)
-            
-            for chunk in doc.noun_chunks:
+
+            # Polish spaCy models don't support noun_chunks,
+            # so we build them from POS tags (NOUN/PROPN/ADJ sequences)
+            try:
+                chunks = list(doc.noun_chunks)
+            except NotImplementedError:
+                chunks = _pos_noun_chunks(doc)
+
+            for chunk in chunks:
                 chunk_text = chunk.text.strip()
                 
                 # --- FILTRACJA ---
