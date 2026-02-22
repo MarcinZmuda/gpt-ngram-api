@@ -3,7 +3,7 @@ services:
     name: ngram-api
     env: python
     plan: free
-    buildCommand: pip install --no-cache-dir -r api/requirements.txt
+    buildCommand: pip install --no-cache-dir -r requirements.txt
     startCommand: gunicorn -w 2 -b 0.0.0.0:$PORT api.index:app
     envVars:
       - key: PORT
