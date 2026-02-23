@@ -56,6 +56,7 @@ def fetch_serp_data(keyword, num_results=10, location_code=2616, language_code="
         "featured_snippet": None,
         "ai_overview": None,
         "related_searches": [],
+        "refinement_chips": [],
         "serp_titles": [],
         "serp_snippets": [],
         "organic_results_raw": [],
@@ -131,6 +132,7 @@ def fetch_serp_data(keyword, num_results=10, location_code=2616, language_code="
         featured_snippet = None
         ai_overview = None
         related_searches = []
+        refinement_chips = []
         serp_titles = []
         serp_snippets = []
         organic_results_raw = []
@@ -307,12 +309,31 @@ def fetch_serp_data(keyword, num_results=10, location_code=2616, language_code="
                         if query:
                             related_searches.append(query)
 
+            # ── v60: Refinement Chips (search intent filters) ──
+            elif item_type == "refinement_chips":
+                rc_items = item.get("items", [])
+                for rc in rc_items:
+                    if isinstance(rc, dict):
+                        title = rc.get("title", "").strip()
+                        if title and len(title) > 1:
+                            refinement_chips.append(title)
+                            # Also extract sub-options if present
+                            options = rc.get("options") or []
+                            for opt in options:
+                                if isinstance(opt, dict):
+                                    opt_title = opt.get("title", "").strip()
+                                    if opt_title and opt_title != title:
+                                        refinement_chips.append(opt_title)
+
         # Log summary
+        if refinement_chips:
+            print(f"[DataForSEO] ✅ Refinement chips: {refinement_chips[:8]}")
         print(f"[DataForSEO] ✅ Parsed: {len(organic_results_raw)} organic, "
               f"{len(paa_questions)} PAA, "
               f"FS={'yes' if featured_snippet else 'no'}, "
               f"AIO={'yes' if ai_overview else 'no'}, "
-              f"{len(related_searches)} related")
+              f"{len(related_searches)} related, "
+              f"{len(refinement_chips)} chips")
 
         return {
             "sources": [],  # Scraping done by caller
@@ -320,6 +341,7 @@ def fetch_serp_data(keyword, num_results=10, location_code=2616, language_code="
             "featured_snippet": featured_snippet,
             "ai_overview": ai_overview,
             "related_searches": related_searches,
+            "refinement_chips": refinement_chips,
             "serp_titles": serp_titles,
             "serp_snippets": serp_snippets,
             "organic_results_raw": organic_results_raw,
