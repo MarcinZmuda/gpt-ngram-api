@@ -41,6 +41,34 @@ _CSS_ENTITY_BLACKLIST_LEGACY = {
     "widget", "sidebar", "container", "wrapper", "content", "section",
 }
 
+def _clean_text_for_nlp(text: str) -> str:
+    """
+    v2.2: Czyści tekst z CSS/JS/HTML artefaktów PRZED przetwarzaniem NER.
+    Importowane przez entity_salience.py do czyszczenia tekstu przed compute_salience().
+    """
+    if not text:
+        return text
+    # Remove CSS blocks: anything between { } including multiline
+    cleaned = re.sub(r'\{[^}]*\}', ' ', text)
+    # Remove inline style declarations: property: value;
+    cleaned = re.sub(r'[\w-]+\s*:\s*[\w#,.()\s%-]+;', ' ', cleaned)
+    # Remove CSS selectors: .class-name, #id-name, element.class
+    cleaned = re.sub(r'[.#][\w-]+(?:\s*[>+~]\s*[.#]?[\w-]+)*', ' ', cleaned)
+    # Remove @media, @import, @font-face blocks
+    cleaned = re.sub(r'@[\w-]+[^;{]*[;{]', ' ', cleaned)
+    # Remove remaining HTML tags
+    cleaned = re.sub(r'<[^>]+>', ' ', cleaned)
+    # Remove CSS/JS artifacts: var(--...), calc(...), rgb(...)
+    cleaned = re.sub(r'(?:var|calc|rgb|rgba|hsl|hsla|url)\s*\([^)]*\)', ' ', cleaned)
+    # Remove hex colors
+    cleaned = re.sub(r'#[0-9a-fA-F]{3,8}\b', ' ', cleaned)
+    # Remove CSS units attached to numbers
+    cleaned = re.sub(r'\d+(?:px|em|rem|vh|vw|pt|%)', ' ', cleaned)
+    # Collapse whitespace
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
+
 def _is_entity_garbage(text):
     """Check if entity text is CSS/JS artifact. Delegates to web_garbage_filter if available."""
     if _is_entity_garbage_v2 is not None:

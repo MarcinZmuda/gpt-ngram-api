@@ -57,6 +57,10 @@ except ImportError:
 if DATAFORSEO_ENABLED:
     print("[S1] ✅ DataForSEO provider available")
 
+# v56.2: Runtime flag — set to True when DataForSEO returns auth error (40100)
+# Prevents futile retry as secondary provider in the same session
+_DATAFORSEO_AUTH_FAILED = False
+
 # SERP_PROVIDER: "dataforseo", "serpapi", or "auto" (default)
 # "auto" = use DataForSEO if configured, fallback to SerpAPI
 SERP_PROVIDER = os.getenv("SERP_PROVIDER", "auto").lower()
@@ -518,12 +522,17 @@ def fetch_serp_sources(keyword, num_results=10):
     serp_metadata = None
 
     try:
+        global _DATAFORSEO_AUTH_FAILED
+
         if SERP_PROVIDER == "dataforseo":
-            if not DATAFORSEO_ENABLED:
-                print("[S1] ❌ SERP_PROVIDER=dataforseo but DataForSEO not configured")
+            if not DATAFORSEO_ENABLED or _DATAFORSEO_AUTH_FAILED:
+                print("[S1] ❌ SERP_PROVIDER=dataforseo but DataForSEO not configured or auth failed")
                 return empty_result
             serp_metadata = dataforseo_fetch(keyword, num_results=num_results)
             provider_used = "dataforseo"
+            # v56.2: Detect auth failure
+            if not serp_metadata.get("organic_results_raw") and not serp_metadata.get("organic_results"):
+                _DATAFORSEO_AUTH_FAILED = True
 
         elif SERP_PROVIDER == "serpapi":
             if not SERPAPI_KEY:
@@ -533,7 +542,7 @@ def fetch_serp_sources(keyword, num_results=10):
             provider_used = "serpapi"
 
         else:  # "auto" — try DataForSEO first, fallback to SerpAPI
-            if DATAFORSEO_ENABLED:
+            if DATAFORSEO_ENABLED and not _DATAFORSEO_AUTH_FAILED:
                 print(f"[S1] 🔄 Auto-mode: trying DataForSEO first...")
                 serp_metadata = dataforseo_fetch(keyword, num_results=num_results)
                 provider_used = "dataforseo"
@@ -541,6 +550,7 @@ def fetch_serp_sources(keyword, num_results=10):
                 has_organic = bool(serp_metadata.get("organic_results_raw"))
                 if not has_organic:
                     print(f"[S1] ⚠️ DataForSEO returned no organic results, falling back to SerpAPI...")
+                    _DATAFORSEO_AUTH_FAILED = True
                     serp_metadata = None
                     provider_used = None
 
@@ -582,6 +592,11 @@ def fetch_serp_sources(keyword, num_results=10):
                 _secondary_name = "serpapi"
             elif provider_used == "serpapi" and DATAFORSEO_ENABLED:
                 _secondary_name = "dataforseo"
+
+            # v56.2: Skip DataForSEO as secondary if auth already failed
+            if _secondary_name == "dataforseo" and _DATAFORSEO_AUTH_FAILED:
+                _secondary_name = None
+                print(f"[S1] ⚠️ Skipping DataForSEO cascade — auth already failed this session")
 
             if _secondary_name:
                 print(f"[S1] 🔄 Missing {', '.join(_missing)} from {provider_used} — trying {_secondary_name}...")
@@ -665,7 +680,11 @@ def fetch_serp_sources(keyword, num_results=10):
                 page_response = requests.get(
                     url,
                     timeout=SCRAPE_TIMEOUT,
-                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.5",
+                    }
                 )
 
                 if page_response.status_code != 200:
@@ -686,22 +705,31 @@ def fetch_serp_sources(keyword, num_results=10):
                         except UnicodeDecodeError:
                             raw_html = page_response.content.decode('utf-8', errors='replace')
 
-                # Limit content size PRZED przetwarzaniem
-                if len(raw_html) > MAX_CONTENT_SIZE * 2:
-                    print(f"[S1] ⚠️ Content too large ({len(raw_html)} chars), truncating: {url[:40]}")
-                    raw_html = raw_html[:MAX_CONTENT_SIZE * 2]
-
-                # Wyciągnij H2 PRZED usunięciem tagów
+                # v56.2: Wyciągnij H2 z PEŁNEGO HTML (przed truncacją)
                 h2_tags = re.findall(r'<h2[^>]*>(.*?)</h2>', raw_html, re.IGNORECASE | re.DOTALL)
                 h2_clean = [re.sub(r'<[^>]+>', '', h).strip() for h in h2_tags]
                 h2_clean = [h for h in h2_clean if h and len(h) < 200 and not re.search(r'[{};]|webkit|moz-|flex-|align-items', h, re.IGNORECASE)]
+
+                # v56.2: Strip boilerplate BEFORE truncation — ensures trafilatura
+                # gets meaningful HTML, not 60K of <script>/<style> from <head>
+                stripped_html = raw_html
+                if len(stripped_html) > MAX_CONTENT_SIZE * 2:
+                    print(f"[S1] ⚠️ Content too large ({len(raw_html)} chars), truncating: {url[:40]}")
+                    # Strip heavy non-content tags first
+                    stripped_html = re.sub(r'<script[^>]*>.*?</script>', '', stripped_html, flags=re.DOTALL | re.IGNORECASE)
+                    stripped_html = re.sub(r'<style[^>]*>.*?</style>', '', stripped_html, flags=re.DOTALL | re.IGNORECASE)
+                    stripped_html = re.sub(r'<svg[^>]*>.*?</svg>', '', stripped_html, flags=re.DOTALL | re.IGNORECASE)
+                    stripped_html = re.sub(r'<noscript[^>]*>.*?</noscript>', '', stripped_html, flags=re.DOTALL | re.IGNORECASE)
+                    stripped_html = re.sub(r'<!--.*?-->', '', stripped_html, flags=re.DOTALL)
+                    # Now truncate the cleaned HTML
+                    stripped_html = stripped_html[:MAX_CONTENT_SIZE * 3]
 
                 # Ekstrakcja treści — trafilatura lub regex fallback
                 content = None
                 if TRAFILATURA_AVAILABLE:
                     try:
                         content = trafilatura.extract(
-                            raw_html,
+                            stripped_html,
                             include_comments=False,
                             include_tables=True,
                             no_fallback=False,
@@ -711,14 +739,17 @@ def fetch_serp_sources(keyword, num_results=10):
                         print(f"[S1] ⚠️ trafilatura failed for {url[:40]}: {e}")
                         content = None
 
-                # Fallback: regex
+                # Fallback: regex — strip remaining boilerplate
                 if not content:
-                    content = raw_html
+                    content = stripped_html
                     content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL | re.IGNORECASE)
                     content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL | re.IGNORECASE)
                     content = re.sub(r'<nav[^>]*>.*?</nav>', '', content, flags=re.DOTALL | re.IGNORECASE)
                     content = re.sub(r'<footer[^>]*>.*?</footer>', '', content, flags=re.DOTALL | re.IGNORECASE)
                     content = re.sub(r'<header[^>]*>.*?</header>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                    content = re.sub(r'<aside[^>]*>.*?</aside>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                    # v56.2: Remove inline CSS/JS artifacts
+                    content = re.sub(r'\{[^}]{0,500}\}', ' ', content)
                     content = re.sub(r'<[^>]+>', ' ', content)
                     content = re.sub(r'\s+', ' ', content).strip()
 
@@ -1208,7 +1239,7 @@ def perform_ngram_analysis():
             "causal_triplets_found": causal_data.get("count", 0) if causal_data else 0,
             "content_gaps_found": content_gaps_data.get("total_gaps", 0) if content_gaps_data else 0,
             "recommended_length": recommended_length,
-            "engine": "v56.0",
+            "engine": "v56.2",
             "lsi_candidates": len(semantic_keyphrases),
         }
     }
@@ -1370,7 +1401,7 @@ def handle_exception(e):
 def health():
     return jsonify({
         "status": "ok",
-        "engine": "v56.0",
+        "engine": "v56.2",
         "limits": {
             "max_content_per_page": MAX_CONTENT_SIZE,
             "max_total_content": MAX_TOTAL_CONTENT,
