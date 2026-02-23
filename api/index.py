@@ -305,12 +305,74 @@ def generate_content_hints(serp_analysis, main_keyword):
 # ======================================================
 def _generate_paa_claude_fallback(keyword: str, serp_data: dict) -> list:
     """
-    v56.0: PAA fallback — removed Anthropic dependency.
-    DataForSEO and SerpAPI both provide PAA natively.
-    Returns empty list — caller handles gracefully.
+    v57.1: PAA fallback via OpenAI API (requests, no SDK needed).
+    Generates 5-8 PAA-style questions when both SerpAPI and DataForSEO
+    return no PAA (common for Polish queries / niche topics).
+    Fallback: returns empty list on any failure.
     """
-    print(f"[PAA_FALLBACK] ℹ️ No PAA from SERP providers for '{keyword}' — skipping (AI fallback removed in v56.0)")
-    return []
+    _oai_key = os.getenv("OPENAI_API_KEY")
+    if not _oai_key:
+        print(f"[PAA_FALLBACK] ⚠️ OPENAI_API_KEY not set — cannot generate PAA for '{keyword}'")
+        return []
+
+    # Build context from SERP data if available
+    _snippets = ""
+    if serp_data:
+        _organic = serp_data.get("organic_results", [])[:5]
+        if _organic:
+            _snippets = "\n".join(
+                f"- {r.get('title', '')}: {r.get('snippet', '')}"
+                for r in _organic if isinstance(r, dict)
+            )
+
+    _prompt = (
+        f"Dla zapytania Google \"{keyword}\" wygeneruj 6 pytań PAA (People Also Ask) "
+        f"w języku polskim. Pytania powinny być naturalne, konkretne i odpowiadać "
+        f"intencji wyszukiwania.\n\n"
+    )
+    if _snippets:
+        _prompt += f"Kontekst z wyników SERP:\n{_snippets}\n\n"
+    _prompt += (
+        "Format: każde pytanie w osobnej linii, bez numerów, bez myślników.\n"
+        "Tylko pytania, zero komentarzy."
+    )
+
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {_oai_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "gpt-4.1-mini",
+                "max_tokens": 300,
+                "temperature": 0.3,
+                "messages": [{"role": "user", "content": _prompt}],
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            print(f"[PAA_FALLBACK] ⚠️ OpenAI API error: {resp.status_code}")
+            return []
+
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        questions = []
+        for line in raw.splitlines():
+            q = line.strip().strip("-•·0123456789.)").strip()
+            if q and len(q) > 10 and "?" in q:
+                questions.append({
+                    "question": q,
+                    "answer": "",
+                    "source": "",
+                    "title": "",
+                    "generated": True,
+                })
+        print(f"[PAA_FALLBACK] ✅ OpenAI generated {len(questions)} PAA questions for '{keyword}'")
+        return questions[:8]
+    except Exception as e:
+        print(f"[PAA_FALLBACK] ⚠️ OpenAI PAA fallback failed: {e}")
+        return []
 
 
 def _fetch_serpapi_data(keyword, num_results=10):
@@ -593,10 +655,15 @@ def fetch_serp_sources(keyword, num_results=10):
             elif provider_used == "serpapi" and DATAFORSEO_ENABLED:
                 _secondary_name = "dataforseo"
 
-            # v56.2: Skip DataForSEO as secondary if auth already failed
+            # v57.1: Don't skip DataForSEO for PAA cascade — empty organic
+            # results ≠ auth failure. DataForSEO may still return PAA even
+            # when organic results are sparse for niche queries.
             if _secondary_name == "dataforseo" and _DATAFORSEO_AUTH_FAILED:
-                _secondary_name = None
-                print(f"[S1] ⚠️ Skipping DataForSEO cascade — auth already failed this session")
+                if "PAA" in _missing:
+                    print(f"[S1] 🔄 DataForSEO auth failed for organic, but trying for PAA anyway...")
+                else:
+                    _secondary_name = None
+                    print(f"[S1] ⚠️ Skipping DataForSEO cascade — auth already failed this session")
 
             if _secondary_name:
                 print(f"[S1] 🔄 Missing {', '.join(_missing)} from {provider_used} — trying {_secondary_name}...")
