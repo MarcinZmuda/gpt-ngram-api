@@ -723,8 +723,7 @@ def is_entity_garbage(text: str) -> bool:
     
     # ---- LEVEL 4: Segment matching ----
     # v2.1: Split on semicolons too — catches "inherit;color", "display;block"
-    # v2.2: Split on curly braces — catches "section{display", "div{margin"
-    segments = re.split(r'[-_.;\s{}()\[\]]', t_lower)
+    segments = re.split(r'[-_.;\s]', t_lower)
     segments = [s for s in segments if s]
     
     if segments:

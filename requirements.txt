@@ -1,5 +1,5 @@
 # ================================================================
-# 🇵🇱 NGRAM API v56.1 — Full Semantic Engine (Firestore + TF-IDF)
+# 🇵🇱 NGRAM API v3.2 — Full Semantic Engine (Firestore + Gemini)
 # ================================================================
 
 # --- CORE ---
@@ -20,9 +20,8 @@ numpy==1.26.4
 scikit-learn==1.3.2
 rapidfuzz==3.9.7
 
-# --- AI ---
-# v56.0: Removed google-generativeai (semantic keyphrases now via TF-IDF/scikit-learn)
-# v56.0: Removed anthropic (PAA fallback no longer needed — DataForSEO/SerpAPI provide PAA)
+# --- AI (Gemini) ---
+google-generativeai==0.5.2
 
 # --- LOGGING ---
 rich==13.7.1

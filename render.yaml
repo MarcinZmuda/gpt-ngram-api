@@ -10,3 +10,5 @@ services:
         value: 10000
       - key: DEBUG_MODE
         value: false
+      - key: GEMINI_API_KEY
+        sync: false

@@ -10,8 +10,7 @@ try:
 except ImportError:
     spacy = None
     SPACY_AVAILABLE = False
-# v56.0: Removed google-generativeai — semantic keyphrases now extracted via TF-IDF (scikit-learn)
-from sklearn.feature_extraction.text import TfidfVectorizer
+import google.generativeai as genai
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -57,10 +56,6 @@ except ImportError:
 if DATAFORSEO_ENABLED:
     print("[S1] ✅ DataForSEO provider available")
 
-# v56.2: Runtime flag — set to True when DataForSEO returns auth error (40100)
-# Prevents futile retry as secondary provider in the same session
-_DATAFORSEO_AUTH_FAILED = False
-
 # SERP_PROVIDER: "dataforseo", "serpapi", or "auto" (default)
 # "auto" = use DataForSEO if configured, fallback to SerpAPI
 SERP_PROVIDER = os.getenv("SERP_PROVIDER", "auto").lower()
@@ -83,9 +78,14 @@ if not firebase_admin._apps:
         print(f"[S1] ⚠️ Firebase init skipped: {e}")
 
 # ======================================================
-# ⚙️ v56.0: Semantic keyphrases via TF-IDF (no external AI)
+# ⚙️ Gemini (Google Generative AI) Configuration
 # ======================================================
-print("[S1] ✅ Semantic keyphrases: TF-IDF extractor (scikit-learn)")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    print("[S1] ✅ Gemini API configured")
+else:
+    print("[S1] ⚠️ GEMINI_API_KEY not set — semantic extraction fallback active")
 
 # ======================================================
 # 🧠 Import local modules (compatible with both local and Render)
@@ -156,72 +156,26 @@ def should_skip_url(url):
     return False
 
 # ======================================================
-# 🧠 Helper: Semantic extraction using TF-IDF (v56.0 — replaces Gemini)
+# 🧠 Helper: Semantic extraction using Gemini Flash
 # ======================================================
-# Polish stop words for TF-IDF filtering
-_TFIDF_STOP_PL = [
-    "i", "w", "na", "z", "do", "że", "się", "nie", "to", "jest", "za", "po",
-    "od", "o", "jak", "ale", "co", "ten", "tym", "być", "może", "już", "tak",
-    "gdy", "lub", "czy", "tego", "tej", "są", "dla", "ich", "przez", "jako",
-    "te", "ze", "tych", "było", "ma", "przy", "które", "który", "która",
-    "których", "jego", "jej", "także", "więc", "tylko", "też", "sobie",
-    "bardzo", "jeszcze", "wszystko", "przed", "między", "pod", "nad", "bez",
-    "oraz", "gdzie", "kiedy", "ile", "jeśli", "strona", "kliknij", "czytaj",
-]
-
-def extract_semantic_keyphrases_tfidf(text, top_n=10):
-    """
-    v56.0: Wyciąga frazy semantyczne z tekstu konkurencji za pomocą TF-IDF.
-    Zastępuje Gemini Flash — zero zależności od zewnętrznego AI, zero hallucynacji.
-    Zwraca format kompatybilny: [{"phrase": "...", "score": 0.xx}]
-    """
-    if not (text or "").strip():
+def extract_semantic_tags_gemini(text, top_n=10):
+    """Używa Google Gemini Flash do wyciągnięcia fraz semantycznych."""
+    if not GEMINI_API_KEY or not (text or "").strip():
         return []
 
     try:
-        # Split text into pseudo-documents (paragraphs) for meaningful TF-IDF
-        paragraphs = [p.strip() for p in re.split(r'\n{2,}|\.\s+', text[:15000]) if len(p.strip()) > 30]
-        if len(paragraphs) < 2:
-            # Fallback: split into chunks of ~200 words
-            words = text[:15000].split()
-            paragraphs = [" ".join(words[i:i+200]) for i in range(0, len(words), 150)]
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        prompt = f"""
+        Jesteś ekspertem SEO. Przeanalizuj poniższy tekst i wypisz {top_n} najważniejszych fraz kluczowych (semantic keywords), które najlepiej oddają jego sens.
+        Zwróć TYLKO listę po przecinku, bez numerowania.
 
-        if not paragraphs:
-            return []
-
-        vectorizer = TfidfVectorizer(
-            ngram_range=(2, 4),
-            max_features=500,
-            stop_words=_TFIDF_STOP_PL,
-            min_df=1,
-            max_df=0.95,
-            token_pattern=r'(?u)\b[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]{2,}\b',
-        )
-        tfidf_matrix = vectorizer.fit_transform(paragraphs)
-        feature_names = vectorizer.get_feature_names_out()
-
-        # Average TF-IDF across all paragraphs (important phrases appear broadly)
-        avg_scores = tfidf_matrix.mean(axis=0).A1
-        top_indices = avg_scores.argsort()[::-1]
-
-        results = []
-        seen_lemmas = set()
-        for idx in top_indices:
-            phrase = feature_names[idx]
-            # Skip near-duplicates (one phrase is substring of another already added)
-            lower = phrase.lower()
-            if any(lower in s or s in lower for s in seen_lemmas):
-                continue
-            seen_lemmas.add(lower)
-            score = round(min(0.95, float(avg_scores[idx]) * 3), 3)
-            results.append({"phrase": phrase, "score": score})
-            if len(results) >= top_n:
-                break
-
-        print(f"[S1] ✅ TF-IDF semantic keyphrases: {len(results)} extracted")
-        return results
+        TEKST: {text[:8000]}...
+        """
+        response = model.generate_content(prompt)
+        keywords = [k.strip() for k in (response.text or "").split(",") if k.strip()]
+        return [{"phrase": kw, "score": 0.95 - (i * 0.02)} for i, kw in enumerate(keywords[:top_n])]
     except Exception as e:
-        print(f"[S1] ❌ TF-IDF Semantic Error: {e}")
+        print(f"[S1] ❌ Gemini Semantic Error: {e}")
         return []
 
 # ======================================================
@@ -305,74 +259,62 @@ def generate_content_hints(serp_analysis, main_keyword):
 # ======================================================
 def _generate_paa_claude_fallback(keyword: str, serp_data: dict) -> list:
     """
-    v57.1: PAA fallback via OpenAI API (requests, no SDK needed).
-    Generates 5-8 PAA-style questions when both SerpAPI and DataForSEO
-    return no PAA (common for Polish queries / niche topics).
-    Fallback: returns empty list on any failure.
+    Fallback: gdy SerpAPI nie zwróci related_questions,
+    generuj PAA z Claude na podstawie keyword + snippetów SERP.
     """
-    _oai_key = os.getenv("OPENAI_API_KEY")
-    if not _oai_key:
-        print(f"[PAA_FALLBACK] ⚠️ OPENAI_API_KEY not set — cannot generate PAA for '{keyword}'")
+    import os as _os, json as _json
+    api_key = _os.getenv("ANTHROPIC_API_KEY") or _os.getenv("CLAUDE_API_KEY")
+    if not api_key:
+        print("[PAA_FALLBACK] ❌ No ANTHROPIC_API_KEY or CLAUDE_API_KEY env var — cannot generate PAA fallback")
         return []
-
-    # Build context from SERP data if available
-    _snippets = ""
-    if serp_data:
-        _organic = serp_data.get("organic_results", [])[:5]
-        if _organic:
-            _snippets = "\n".join(
-                f"- {r.get('title', '')}: {r.get('snippet', '')}"
-                for r in _organic if isinstance(r, dict)
-            )
-
-    _prompt = (
-        f"Dla zapytania Google \"{keyword}\" wygeneruj 6 pytań PAA (People Also Ask) "
-        f"w języku polskim. Pytania powinny być naturalne, konkretne i odpowiadać "
-        f"intencji wyszukiwania.\n\n"
-    )
-    if _snippets:
-        _prompt += f"Kontekst z wyników SERP:\n{_snippets}\n\n"
-    _prompt += (
-        "Format: każde pytanie w osobnej linii, bez numerów, bez myślników.\n"
-        "Tylko pytania, zero komentarzy."
-    )
-
+    print(f"[PAA_FALLBACK] 🔑 Using Anthropic API key ({api_key[:8]}...)")
     try:
-        resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {_oai_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "gpt-4.1-mini",
-                "max_tokens": 300,
-                "temperature": 0.3,
-                "messages": [{"role": "user", "content": _prompt}],
-            },
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            print(f"[PAA_FALLBACK] ⚠️ OpenAI API error: {resp.status_code}")
-            return []
+        import anthropic as _anthropic
+        client = _anthropic.Anthropic(api_key=api_key)
 
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
-        questions = []
-        for line in raw.splitlines():
-            q = line.strip().strip("-•·0123456789.)").strip()
-            if q and len(q) > 10 and "?" in q:
-                questions.append({
-                    "question": q,
-                    "answer": "",
-                    "source": "",
-                    "title": "",
-                    "generated": True,
-                })
-        print(f"[PAA_FALLBACK] ✅ OpenAI generated {len(questions)} PAA questions for '{keyword}'")
-        return questions[:8]
+        # Zbierz kontekst z SERP
+        snippets = []
+        for r in (serp_data.get("organic_results") or [])[:6]:
+            t = r.get("title", "")
+            s = r.get("snippet", "")
+            if t or s:
+                snippets.append(f"- {t}: {s}")
+
+        ai_ov = serp_data.get("ai_overview", {})
+        ai_text = ""
+        if isinstance(ai_ov, dict):
+            ai_text = ai_ov.get("text", "") or ""
+        elif isinstance(ai_ov, str):
+            ai_text = ai_ov
+
+        context = "\n".join(snippets[:6])
+        if ai_text:
+            context = "AI Overview: " + ai_text[:300] + "\n\n" + context
+
+        prompt = (
+            f"Dla frazy: \"{keyword}\"\n"
+            f"Kontekst z Google:\n{context[:1500]}\n\n"
+            "Wygeneruj 6 pytań które użytkownicy zadają w sekcji \"Ludzie pytają też\" (People Also Ask) na Google.\n"
+            "Pytania muszą być po polsku, konkretne, rzeczowe.\n"
+            "Zwróć TYLKO JSON array: [{\"question\": \"...\", \"answer\": \"...\"}]\n"
+            "Każda odpowiedź 1-2 zdania."
+        )
+
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=800,
+            temperature=0,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = resp.content[0].text.strip()
+        import re as _re
+        m = _re.search(r"\[[\s\S]*\]", text)
+        if m:
+            questions = _json.loads(m.group())
+            return [{"question": q.get("question",""), "answer": q.get("answer",""), "source": "claude_fallback"} for q in questions if q.get("question")]
     except Exception as e:
-        print(f"[PAA_FALLBACK] ⚠️ OpenAI PAA fallback failed: {e}")
-        return []
+        print(f"[PAA_FALLBACK] Error: {e}")
+    return []
 
 
 def _fetch_serpapi_data(keyword, num_results=10):
@@ -584,17 +526,12 @@ def fetch_serp_sources(keyword, num_results=10):
     serp_metadata = None
 
     try:
-        global _DATAFORSEO_AUTH_FAILED
-
         if SERP_PROVIDER == "dataforseo":
-            if not DATAFORSEO_ENABLED or _DATAFORSEO_AUTH_FAILED:
-                print("[S1] ❌ SERP_PROVIDER=dataforseo but DataForSEO not configured or auth failed")
+            if not DATAFORSEO_ENABLED:
+                print("[S1] ❌ SERP_PROVIDER=dataforseo but DataForSEO not configured")
                 return empty_result
             serp_metadata = dataforseo_fetch(keyword, num_results=num_results)
             provider_used = "dataforseo"
-            # v56.2: Detect auth failure
-            if not serp_metadata.get("organic_results_raw") and not serp_metadata.get("organic_results"):
-                _DATAFORSEO_AUTH_FAILED = True
 
         elif SERP_PROVIDER == "serpapi":
             if not SERPAPI_KEY:
@@ -604,7 +541,7 @@ def fetch_serp_sources(keyword, num_results=10):
             provider_used = "serpapi"
 
         else:  # "auto" — try DataForSEO first, fallback to SerpAPI
-            if DATAFORSEO_ENABLED and not _DATAFORSEO_AUTH_FAILED:
+            if DATAFORSEO_ENABLED:
                 print(f"[S1] 🔄 Auto-mode: trying DataForSEO first...")
                 serp_metadata = dataforseo_fetch(keyword, num_results=num_results)
                 provider_used = "dataforseo"
@@ -612,7 +549,6 @@ def fetch_serp_sources(keyword, num_results=10):
                 has_organic = bool(serp_metadata.get("organic_results_raw"))
                 if not has_organic:
                     print(f"[S1] ⚠️ DataForSEO returned no organic results, falling back to SerpAPI...")
-                    _DATAFORSEO_AUTH_FAILED = True
                     serp_metadata = None
                     provider_used = None
 
@@ -635,75 +571,16 @@ def fetch_serp_sources(keyword, num_results=10):
         serp_titles = serp_metadata.get("serp_titles", [])
         serp_snippets = serp_metadata.get("serp_snippets", [])
 
-        # ── v55.2: PAA/AI Overview/Snippet cascade ──
-        # Jeśli primary provider nie zwrócił PAA, AI Overview lub Snippet,
-        # spróbuj drugiego providera zanim fallback do Claude.
-        _missing = []
+        # ── PAA Claude fallback (if no PAA from any provider) ──
         if not paa_questions:
-            _missing.append("PAA")
-        if not ai_overview:
-            _missing.append("AIO")
-        if not featured_snippet:
-            _missing.append("FS")
-
-        if _missing:
-            # Determine which secondary provider to try
-            _secondary = None
-            _secondary_name = None
-            if provider_used == "dataforseo" and SERPAPI_KEY:
-                _secondary_name = "serpapi"
-            elif provider_used == "serpapi" and DATAFORSEO_ENABLED:
-                _secondary_name = "dataforseo"
-
-            # v57.1: Don't skip DataForSEO for PAA cascade — empty organic
-            # results ≠ auth failure. DataForSEO may still return PAA even
-            # when organic results are sparse for niche queries.
-            if _secondary_name == "dataforseo" and _DATAFORSEO_AUTH_FAILED:
-                if "PAA" in _missing:
-                    print(f"[S1] 🔄 DataForSEO auth failed for organic, but trying for PAA anyway...")
-                else:
-                    _secondary_name = None
-                    print(f"[S1] ⚠️ Skipping DataForSEO cascade — auth already failed this session")
-
-            if _secondary_name:
-                print(f"[S1] 🔄 Missing {', '.join(_missing)} from {provider_used} — trying {_secondary_name}...")
-                try:
-                    if _secondary_name == "serpapi":
-                        _secondary = _fetch_serpapi_data(keyword, num_results=num_results)
-                    else:
-                        _secondary = dataforseo_fetch(keyword, num_results=num_results)
-
-                    if _secondary:
-                        if not paa_questions:
-                            _sec_paa = _secondary.get("paa", [])
-                            if _sec_paa:
-                                paa_questions = _sec_paa
-                                print(f"[S1] ✅ PAA from {_secondary_name}: {len(_sec_paa)} questions")
-                        if not ai_overview:
-                            _sec_aio = _secondary.get("ai_overview")
-                            if _sec_aio:
-                                ai_overview = _sec_aio
-                                print(f"[S1] ✅ AI Overview from {_secondary_name}")
-                        if not featured_snippet:
-                            _sec_fs = _secondary.get("featured_snippet")
-                            if _sec_fs:
-                                featured_snippet = _sec_fs
-                                print(f"[S1] ✅ Featured Snippet from {_secondary_name}")
-                        if not related_searches:
-                            _sec_rs = _secondary.get("related_searches", [])
-                            if _sec_rs:
-                                related_searches = _sec_rs
-                except Exception as _sec_err:
-                    print(f"[S1] ⚠️ Secondary provider {_secondary_name} error: {_sec_err}")
-
-        # ── PAA Claude fallback (if still no PAA after both providers) ──
-        if not paa_questions:
-            print(f"[S1] ⚠️ No PAA from any provider — generating with Claude fallback...")
+            print(f"[S1] ⚠️ No PAA from {provider_used} — generating with Claude fallback...")
+            # v55.1: Fix — DataForSEO nie zwraca _serp_data, budujemy kontekst z dostępnych danych
             serp_data_for_fallback = serp_metadata.get("_serp_data", {})
             if not serp_data_for_fallback:
+                # Zbuduj kontekst z danych DataForSEO/innego providera
                 serp_data_for_fallback = {
                     "organic_results": serp_metadata.get("organic_results_raw") or serp_metadata.get("organic_results", []),
-                    "ai_overview": ai_overview,
+                    "ai_overview": serp_metadata.get("ai_overview"),
                 }
             paa_questions = _generate_paa_claude_fallback(keyword, serp_data_for_fallback)
             if paa_questions:
@@ -747,11 +624,7 @@ def fetch_serp_sources(keyword, num_results=10):
                 page_response = requests.get(
                     url,
                     timeout=SCRAPE_TIMEOUT,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.5",
-                    }
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
                 )
 
                 if page_response.status_code != 200:
@@ -772,31 +645,22 @@ def fetch_serp_sources(keyword, num_results=10):
                         except UnicodeDecodeError:
                             raw_html = page_response.content.decode('utf-8', errors='replace')
 
-                # v56.2: Wyciągnij H2 z PEŁNEGO HTML (przed truncacją)
+                # Limit content size PRZED przetwarzaniem
+                if len(raw_html) > MAX_CONTENT_SIZE * 2:
+                    print(f"[S1] ⚠️ Content too large ({len(raw_html)} chars), truncating: {url[:40]}")
+                    raw_html = raw_html[:MAX_CONTENT_SIZE * 2]
+
+                # Wyciągnij H2 PRZED usunięciem tagów
                 h2_tags = re.findall(r'<h2[^>]*>(.*?)</h2>', raw_html, re.IGNORECASE | re.DOTALL)
                 h2_clean = [re.sub(r'<[^>]+>', '', h).strip() for h in h2_tags]
                 h2_clean = [h for h in h2_clean if h and len(h) < 200 and not re.search(r'[{};]|webkit|moz-|flex-|align-items', h, re.IGNORECASE)]
-
-                # v56.2: Strip boilerplate BEFORE truncation — ensures trafilatura
-                # gets meaningful HTML, not 60K of <script>/<style> from <head>
-                stripped_html = raw_html
-                if len(stripped_html) > MAX_CONTENT_SIZE * 2:
-                    print(f"[S1] ⚠️ Content too large ({len(raw_html)} chars), truncating: {url[:40]}")
-                    # Strip heavy non-content tags first
-                    stripped_html = re.sub(r'<script[^>]*>.*?</script>', '', stripped_html, flags=re.DOTALL | re.IGNORECASE)
-                    stripped_html = re.sub(r'<style[^>]*>.*?</style>', '', stripped_html, flags=re.DOTALL | re.IGNORECASE)
-                    stripped_html = re.sub(r'<svg[^>]*>.*?</svg>', '', stripped_html, flags=re.DOTALL | re.IGNORECASE)
-                    stripped_html = re.sub(r'<noscript[^>]*>.*?</noscript>', '', stripped_html, flags=re.DOTALL | re.IGNORECASE)
-                    stripped_html = re.sub(r'<!--.*?-->', '', stripped_html, flags=re.DOTALL)
-                    # Now truncate the cleaned HTML
-                    stripped_html = stripped_html[:MAX_CONTENT_SIZE * 3]
 
                 # Ekstrakcja treści — trafilatura lub regex fallback
                 content = None
                 if TRAFILATURA_AVAILABLE:
                     try:
                         content = trafilatura.extract(
-                            stripped_html,
+                            raw_html,
                             include_comments=False,
                             include_tables=True,
                             no_fallback=False,
@@ -806,17 +670,14 @@ def fetch_serp_sources(keyword, num_results=10):
                         print(f"[S1] ⚠️ trafilatura failed for {url[:40]}: {e}")
                         content = None
 
-                # Fallback: regex — strip remaining boilerplate
+                # Fallback: regex
                 if not content:
-                    content = stripped_html
+                    content = raw_html
                     content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL | re.IGNORECASE)
                     content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL | re.IGNORECASE)
                     content = re.sub(r'<nav[^>]*>.*?</nav>', '', content, flags=re.DOTALL | re.IGNORECASE)
                     content = re.sub(r'<footer[^>]*>.*?</footer>', '', content, flags=re.DOTALL | re.IGNORECASE)
                     content = re.sub(r'<header[^>]*>.*?</header>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                    content = re.sub(r'<aside[^>]*>.*?</aside>', '', content, flags=re.DOTALL | re.IGNORECASE)
-                    # v56.2: Remove inline CSS/JS artifacts
-                    content = re.sub(r'\{[^}]{0,500}\}', ' ', content)
                     content = re.sub(r'<[^>]+>', ' ', content)
                     content = re.sub(r'\s+', ' ', content).strip()
 
@@ -1081,9 +942,9 @@ def perform_ngram_analysis():
 
     results = sorted(results, key=lambda x: x["weight"], reverse=True)[:top_n]
 
-    # 2️⃣ Semantyka (TF-IDF — v56.0, replaces Gemini Flash)
+    # 2️⃣ Semantyka (Gemini Flash)
     full_text_sample = " ".join(all_text_content)[:15000]
-    semantic_keyphrases = extract_semantic_keyphrases_tfidf(full_text_sample)
+    semantic_keyphrases = extract_semantic_tags_gemini(full_text_sample)
 
     # ⭐ H2 konkurencji z CZĘSTOŚCIĄ (ile stron używa danego wzorca)
     # Liczymy per source żeby H2 z 1 strony nie zdominowało przez repetycje
@@ -1306,7 +1167,7 @@ def perform_ngram_analysis():
             "causal_triplets_found": causal_data.get("count", 0) if causal_data else 0,
             "content_gaps_found": content_gaps_data.get("total_gaps", 0) if content_gaps_data else 0,
             "recommended_length": recommended_length,
-            "engine": "v56.2",
+            "engine": "v55.0",
             "lsi_candidates": len(semantic_keyphrases),
         }
     }
@@ -1468,7 +1329,7 @@ def handle_exception(e):
 def health():
     return jsonify({
         "status": "ok",
-        "engine": "v56.2",
+        "engine": "v55.0",
         "limits": {
             "max_content_per_page": MAX_CONTENT_SIZE,
             "max_total_content": MAX_TOTAL_CONTENT,
@@ -1476,7 +1337,7 @@ def health():
             "skip_domains": SKIP_DOMAINS
         },
         "features": {
-            "tfidf_semantic_enabled": True,
+            "gemini_enabled": bool(GEMINI_API_KEY),
             "serpapi_enabled": bool(SERPAPI_KEY),
             "dataforseo_enabled": DATAFORSEO_ENABLED,
             "serp_provider": SERP_PROVIDER,
