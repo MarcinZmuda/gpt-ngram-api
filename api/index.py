@@ -305,16 +305,10 @@ def generate_content_hints(serp_analysis, main_keyword):
 # ======================================================
 def _generate_paa_claude_fallback(keyword: str, serp_data: dict) -> list:
     """
-    v57.1: PAA fallback via OpenAI API (requests, no SDK needed).
+    v61: PAA fallback via Anthropic Haiku (primary) or OpenAI (fallback).
     Generates 5-8 PAA-style questions when both SerpAPI and DataForSEO
     return no PAA (common for Polish queries / niche topics).
-    Fallback: returns empty list on any failure.
     """
-    _oai_key = os.getenv("OPENAI_API_KEY")
-    if not _oai_key:
-        print(f"[PAA_FALLBACK] ⚠️ OPENAI_API_KEY not set — cannot generate PAA for '{keyword}'")
-        return []
-
     # Build context from SERP data if available
     _snippets = ""
     if serp_data:
@@ -337,42 +331,86 @@ def _generate_paa_claude_fallback(keyword: str, serp_data: dict) -> list:
         "Tylko pytania, zero komentarzy."
     )
 
+    # Try Anthropic first, then OpenAI
+    raw = _paa_call_anthropic(_prompt, keyword) or _paa_call_openai(_prompt, keyword)
+    if not raw:
+        return []
+
+    questions = []
+    for line in raw.splitlines():
+        q = line.strip().strip("-•·0123456789.)").strip()
+        if q and len(q) > 10 and "?" in q:
+            questions.append({
+                "question": q,
+                "answer": "",
+                "source": "",
+                "title": "",
+                "generated": True,
+            })
+    if questions:
+        print(f"[PAA_FALLBACK] ✅ Generated {len(questions)} PAA questions for '{keyword}'")
+    return questions[:8]
+
+
+def _paa_call_anthropic(prompt: str, keyword: str) -> str:
+    """Call Anthropic Haiku for PAA generation."""
+    _key = os.getenv("ANTHROPIC_API_KEY")
+    if not _key:
+        print(f"[PAA_FALLBACK] ℹ️ ANTHROPIC_API_KEY not set, trying OpenAI...")
+        return ""
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": _key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 300,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            print(f"[PAA_FALLBACK] ⚠️ Anthropic API error: {resp.status_code}")
+            return ""
+        content = resp.json().get("content", [])
+        return content[0].get("text", "").strip() if content else ""
+    except Exception as e:
+        print(f"[PAA_FALLBACK] ⚠️ Anthropic PAA error: {e}")
+        return ""
+
+
+def _paa_call_openai(prompt: str, keyword: str) -> str:
+    """Call OpenAI for PAA generation (fallback)."""
+    _key = os.getenv("OPENAI_API_KEY")
+    if not _key:
+        print(f"[PAA_FALLBACK] ⚠️ No API key available for PAA generation ('{keyword}')")
+        return ""
     try:
         resp = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {_oai_key}",
+                "Authorization": f"Bearer {_key}",
                 "Content-Type": "application/json",
             },
             json={
                 "model": "gpt-4.1-mini",
                 "max_tokens": 300,
                 "temperature": 0.3,
-                "messages": [{"role": "user", "content": _prompt}],
+                "messages": [{"role": "user", "content": prompt}],
             },
             timeout=15,
         )
         if resp.status_code != 200:
             print(f"[PAA_FALLBACK] ⚠️ OpenAI API error: {resp.status_code}")
-            return []
-
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
-        questions = []
-        for line in raw.splitlines():
-            q = line.strip().strip("-•·0123456789.)").strip()
-            if q and len(q) > 10 and "?" in q:
-                questions.append({
-                    "question": q,
-                    "answer": "",
-                    "source": "",
-                    "title": "",
-                    "generated": True,
-                })
-        print(f"[PAA_FALLBACK] ✅ OpenAI generated {len(questions)} PAA questions for '{keyword}'")
-        return questions[:8]
+            return ""
+        return resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        print(f"[PAA_FALLBACK] ⚠️ OpenAI PAA fallback failed: {e}")
-        return []
+        print(f"[PAA_FALLBACK] ⚠️ OpenAI PAA error: {e}")
+        return ""
 
 
 def _fetch_serpapi_data(keyword, num_results=10):
