@@ -143,9 +143,15 @@ def compute_salience(
     h2_patterns = h2_patterns or []
     h1_patterns = h1_patterns or []
     
-    # Lowercase versions for matching
-    h2_lower = [h.lower() for h in h2_patterns]
-    h1_lower = [h.lower() for h in h1_patterns]
+    # Lowercase versions for matching (h2/h1 can be str or dict with "text" key)
+    h2_lower = [
+        (h["text"].lower() if isinstance(h, dict) else h.lower())
+        for h in h2_patterns
+    ]
+    h1_lower = [
+        (h["text"].lower() if isinstance(h, dict) else h.lower())
+        for h in h1_patterns
+    ]
     
     # Build entity lookup
     entity_signals: Dict[str, SalienceSignals] = {}
@@ -220,14 +226,16 @@ def compute_salience(
                 if h1 not in signals.heading_texts:
                     # Find original case version
                     idx = h1_lower.index(h1)
-                    signals.heading_texts.append(h1_patterns[idx] if idx < len(h1_patterns) else h1)
+                    orig = h1_patterns[idx] if idx < len(h1_patterns) else h1
+                    signals.heading_texts.append(orig["text"] if isinstance(orig, dict) else orig)
         
         # Check H2
         for i, h2 in enumerate(h2_lower):
             if key in h2 or _fuzzy_match(key, h2):
                 signals.in_h2_count += 1
                 if len(signals.heading_texts) < 5:
-                    signals.heading_texts.append(h2_patterns[i] if i < len(h2_patterns) else h2)
+                    orig = h2_patterns[i] if i < len(h2_patterns) else h2
+                    signals.heading_texts.append(orig["text"] if isinstance(orig, dict) else orig)
         
         # Subject ratio
         total_roles = signals.as_subject_count + signals.as_object_count
