@@ -571,16 +571,65 @@ def fetch_serp_sources(keyword, num_results=10):
         serp_titles = serp_metadata.get("serp_titles", [])
         serp_snippets = serp_metadata.get("serp_snippets", [])
 
-        # ── PAA Claude fallback (if no PAA from any provider) ──
+        # ── v55.2: PAA/AI Overview/Snippet cascade ──
+        # Jeśli primary provider nie zwrócił PAA, AI Overview lub Snippet,
+        # spróbuj drugiego providera zanim fallback do Claude.
+        _missing = []
         if not paa_questions:
-            print(f"[S1] ⚠️ No PAA from {provider_used} — generating with Claude fallback...")
-            # v55.1: Fix — DataForSEO nie zwraca _serp_data, budujemy kontekst z dostępnych danych
+            _missing.append("PAA")
+        if not ai_overview:
+            _missing.append("AIO")
+        if not featured_snippet:
+            _missing.append("FS")
+
+        if _missing:
+            # Determine which secondary provider to try
+            _secondary = None
+            _secondary_name = None
+            if provider_used == "dataforseo" and SERPAPI_KEY:
+                _secondary_name = "serpapi"
+            elif provider_used == "serpapi" and DATAFORSEO_ENABLED:
+                _secondary_name = "dataforseo"
+
+            if _secondary_name:
+                print(f"[S1] 🔄 Missing {', '.join(_missing)} from {provider_used} — trying {_secondary_name}...")
+                try:
+                    if _secondary_name == "serpapi":
+                        _secondary = _fetch_serpapi_data(keyword, num_results=num_results)
+                    else:
+                        _secondary = dataforseo_fetch(keyword, num_results=num_results)
+
+                    if _secondary:
+                        if not paa_questions:
+                            _sec_paa = _secondary.get("paa", [])
+                            if _sec_paa:
+                                paa_questions = _sec_paa
+                                print(f"[S1] ✅ PAA from {_secondary_name}: {len(_sec_paa)} questions")
+                        if not ai_overview:
+                            _sec_aio = _secondary.get("ai_overview")
+                            if _sec_aio:
+                                ai_overview = _sec_aio
+                                print(f"[S1] ✅ AI Overview from {_secondary_name}")
+                        if not featured_snippet:
+                            _sec_fs = _secondary.get("featured_snippet")
+                            if _sec_fs:
+                                featured_snippet = _sec_fs
+                                print(f"[S1] ✅ Featured Snippet from {_secondary_name}")
+                        if not related_searches:
+                            _sec_rs = _secondary.get("related_searches", [])
+                            if _sec_rs:
+                                related_searches = _sec_rs
+                except Exception as _sec_err:
+                    print(f"[S1] ⚠️ Secondary provider {_secondary_name} error: {_sec_err}")
+
+        # ── PAA Claude fallback (if still no PAA after both providers) ──
+        if not paa_questions:
+            print(f"[S1] ⚠️ No PAA from any provider — generating with Claude fallback...")
             serp_data_for_fallback = serp_metadata.get("_serp_data", {})
             if not serp_data_for_fallback:
-                # Zbuduj kontekst z danych DataForSEO/innego providera
                 serp_data_for_fallback = {
                     "organic_results": serp_metadata.get("organic_results_raw") or serp_metadata.get("organic_results", []),
-                    "ai_overview": serp_metadata.get("ai_overview"),
+                    "ai_overview": ai_overview,
                 }
             paa_questions = _generate_paa_claude_fallback(keyword, serp_data_for_fallback)
             if paa_questions:
