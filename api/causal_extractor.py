@@ -94,12 +94,7 @@ def _extract_via_llm(
     main_keyword: str,
     max_triplets: int
 ) -> List[CausalTriplet]:
-    """Extract causal relations via OpenAI gpt-4.1-mini."""
-
-    oai_key = os.getenv("OPENAI_API_KEY")
-    if not oai_key:
-        logger.warning("[CAUSAL_V2] OPENAI_API_KEY not set")
-        return []
+    """Extract causal relations via Anthropic Haiku (primary) or OpenAI (fallback)."""
 
     if not _requests:
         logger.warning("[CAUSAL_V2] requests module not available")
@@ -124,6 +119,59 @@ def _extract_via_llm(
         f'TEKST:\n{text[:6000]}'
     )
 
+    # Try Anthropic first (primary), then OpenAI (fallback)
+    raw = _call_anthropic(prompt) or _call_openai(prompt)
+    if not raw:
+        return []
+
+    return _parse_triplets_json(raw)
+
+
+def _call_anthropic(prompt: str) -> str:
+    """Call Anthropic Haiku. Returns raw text or empty string."""
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        logger.debug("[CAUSAL_V2] ANTHROPIC_API_KEY not set, skipping")
+        return ""
+
+    try:
+        resp = _requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 800,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=20,
+        )
+
+        if resp.status_code != 200:
+            logger.warning(f"[CAUSAL_V2] Anthropic API error: {resp.status_code} {resp.text[:200]}")
+            return ""
+
+        data = resp.json()
+        content = data.get("content", [])
+        if content and isinstance(content, list):
+            return content[0].get("text", "").strip()
+        return ""
+
+    except Exception as e:
+        logger.warning(f"[CAUSAL_V2] Anthropic call error: {e}")
+        return ""
+
+
+def _call_openai(prompt: str) -> str:
+    """Call OpenAI gpt-4.1-mini (fallback). Returns raw text or empty string."""
+    oai_key = os.getenv("OPENAI_API_KEY")
+    if not oai_key:
+        logger.debug("[CAUSAL_V2] OPENAI_API_KEY not set, skipping fallback")
+        return ""
+
     try:
         resp = _requests.post(
             "https://api.openai.com/v1/chat/completions",
@@ -142,11 +190,19 @@ def _extract_via_llm(
 
         if resp.status_code != 200:
             logger.warning(f"[CAUSAL_V2] OpenAI API error: {resp.status_code}")
-            return []
+            return ""
 
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        return resp.json()["choices"][0]["message"]["content"].strip()
 
-        # Parse JSON — handle markdown code blocks
+    except Exception as e:
+        logger.warning(f"[CAUSAL_V2] OpenAI call error: {e}")
+        return ""
+
+
+def _parse_triplets_json(raw: str) -> List[CausalTriplet]:
+    """Parse JSON array of triplets from LLM response."""
+    try:
+        # Handle markdown code blocks
         raw = re.sub(r'^```(?:json)?\s*', '', raw)
         raw = re.sub(r'\s*```$', '', raw)
 
@@ -190,7 +246,7 @@ def _extract_via_llm(
         logger.warning(f"[CAUSAL_V2] JSON parse error: {e}")
         return []
     except Exception as e:
-        logger.error(f"[CAUSAL_V2] LLM extraction error: {e}")
+        logger.error(f"[CAUSAL_V2] Parse error: {e}")
         return []
 
 
