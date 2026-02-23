@@ -10,10 +10,7 @@ try:
 except ImportError:
     spacy = None
     SPACY_AVAILABLE = False
-# v56.0: Removed google-generativeai — semantic keyphrases now extracted via TF-IDF (scikit-learn)
 from sklearn.feature_extraction.text import TfidfVectorizer
-import firebase_admin
-from firebase_admin import credentials, firestore
 
 # 🆕 v28.0: trafilatura for clean content extraction (eliminates CSS garbage)
 try:
@@ -63,25 +60,12 @@ SERP_PROVIDER = os.getenv("SERP_PROVIDER", "auto").lower()
 print(f"[S1] 🔧 SERP_PROVIDER={SERP_PROVIDER} (DataForSEO={'✅' if DATAFORSEO_ENABLED else '❌'}, SerpAPI={'✅' if SERPAPI_KEY else '❌'})")
 
 # ======================================================
-# 🔥 Firebase Initialization (Safe for Render & Local)
+# 🔥 Firebase REMOVED (v56.0) — not used in production
 # ======================================================
-if not firebase_admin._apps:
-    cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    try:
-        if cred_path and os.path.exists(cred_path):
-            cred = credentials.Certificate(cred_path)
-            firebase_admin.initialize_app(cred)
-            print(f"[S1] ✅ Firebase initialized from credentials file: {cred_path}")
-        else:
-            firebase_admin.initialize_app()
-            print("[S1] ✅ Firebase initialized with default credentials")
-    except Exception as e:
-        print(f"[S1] ⚠️ Firebase init skipped: {e}")
 
 # ======================================================
-# ⚙️ v56.0: Semantic keyphrases via TF-IDF (no external AI)
+# ⚙️ Gemini REMOVED (v56.0) — replaced by TF-IDF extraction
 # ======================================================
-print("[S1] ✅ Semantic keyphrases: TF-IDF extractor (scikit-learn)")
 
 # ======================================================
 # 🧠 Import local modules (compatible with both local and Render)
@@ -152,72 +136,53 @@ def should_skip_url(url):
     return False
 
 # ======================================================
-# 🧠 Helper: Semantic extraction using TF-IDF (v56.0 — replaces Gemini)
+# 🧠 Helper: Semantic extraction using Gemini Flash
 # ======================================================
-# Polish stop words for TF-IDF filtering
-_TFIDF_STOP_PL = [
-    "i", "w", "na", "z", "do", "że", "się", "nie", "to", "jest", "za", "po",
-    "od", "o", "jak", "ale", "co", "ten", "tym", "być", "może", "już", "tak",
-    "gdy", "lub", "czy", "tego", "tej", "są", "dla", "ich", "przez", "jako",
-    "te", "ze", "tych", "było", "ma", "przy", "które", "który", "która",
-    "których", "jego", "jej", "także", "więc", "tylko", "też", "sobie",
-    "bardzo", "jeszcze", "wszystko", "przed", "między", "pod", "nad", "bez",
-    "oraz", "gdzie", "kiedy", "ile", "jeśli", "strona", "kliknij", "czytaj",
-]
-
 def extract_semantic_keyphrases_tfidf(text, top_n=10):
-    """
-    v56.0: Wyciąga frazy semantyczne z tekstu konkurencji za pomocą TF-IDF.
-    Zastępuje Gemini Flash — zero zależności od zewnętrznego AI, zero hallucynacji.
-    Zwraca format kompatybilny: [{"phrase": "...", "score": 0.xx}]
-    """
+    """Wyciąga frazy semantyczne z tekstu konkurencji za pomocą TF-IDF (bez zewnętrznego API)."""
     if not (text or "").strip():
         return []
 
     try:
-        # Split text into pseudo-documents (paragraphs) for meaningful TF-IDF
-        paragraphs = [p.strip() for p in re.split(r'\n{2,}|\.\s+', text[:15000]) if len(p.strip()) > 30]
-        if len(paragraphs) < 2:
-            # Fallback: split into chunks of ~200 words
-            words = text[:15000].split()
-            paragraphs = [" ".join(words[i:i+200]) for i in range(0, len(words), 150)]
+        # Dziel tekst na zdania jako "dokumenty" dla TF-IDF
+        sentences = re.split(r'[.!?]\s+', text[:15000])
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
 
-        if not paragraphs:
+        if len(sentences) < 3:
             return []
 
         vectorizer = TfidfVectorizer(
             ngram_range=(2, 4),
-            max_features=500,
-            stop_words=_TFIDF_STOP_PL,
-            min_df=1,
-            max_df=0.95,
-            token_pattern=r'(?u)\b[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]{2,}\b',
+            max_features=200,
+            min_df=2,
+            max_df=0.85,
+            stop_words=None  # Polish — no built-in stop words
         )
-        tfidf_matrix = vectorizer.fit_transform(paragraphs)
+        tfidf_matrix = vectorizer.fit_transform(sentences)
         feature_names = vectorizer.get_feature_names_out()
 
-        # Average TF-IDF across all paragraphs (important phrases appear broadly)
-        avg_scores = tfidf_matrix.mean(axis=0).A1
-        top_indices = avg_scores.argsort()[::-1]
+        # Średni TF-IDF score per fraza
+        scores = tfidf_matrix.mean(axis=0).A1
+        ranked = sorted(zip(feature_names, scores), key=lambda x: -x[1])
 
+        # Filtruj: min 2 słowa, bez powtórzeń pojedynczych słów
         results = []
-        seen_lemmas = set()
-        for idx in top_indices:
-            phrase = feature_names[idx]
-            # Skip near-duplicates (one phrase is substring of another already added)
-            lower = phrase.lower()
-            if any(lower in s or s in lower for s in seen_lemmas):
+        seen_words = set()
+        for phrase, score in ranked:
+            words = phrase.split()
+            if len(words) < 2:
                 continue
-            seen_lemmas.add(lower)
-            score = round(min(0.95, float(avg_scores[idx]) * 3), 3)
-            results.append({"phrase": phrase, "score": score})
+            key = frozenset(words)
+            if key in seen_words:
+                continue
+            seen_words.add(key)
+            results.append({"phrase": phrase, "score": round(float(score), 4)})
             if len(results) >= top_n:
                 break
 
-        print(f"[S1] ✅ TF-IDF semantic keyphrases: {len(results)} extracted")
         return results
     except Exception as e:
-        print(f"[S1] ❌ TF-IDF Semantic Error: {e}")
+        print(f"[S1] ⚠️ TF-IDF Semantic Error: {e}")
         return []
 
 # ======================================================
@@ -301,11 +266,61 @@ def generate_content_hints(serp_analysis, main_keyword):
 # ======================================================
 def _generate_paa_claude_fallback(keyword: str, serp_data: dict) -> list:
     """
-    v56.0: PAA fallback — removed Anthropic dependency.
-    DataForSEO and SerpAPI both provide PAA natively.
-    Returns empty list — caller handles gracefully.
+    Fallback: gdy SerpAPI nie zwróci related_questions,
+    generuj PAA z Claude na podstawie keyword + snippetów SERP.
     """
-    print(f"[PAA_FALLBACK] ℹ️ No PAA from SERP providers for '{keyword}' — skipping (AI fallback removed in v56.0)")
+    import os as _os, json as _json
+    api_key = _os.getenv("ANTHROPIC_API_KEY") or _os.getenv("CLAUDE_API_KEY")
+    if not api_key:
+        print("[PAA_FALLBACK] ❌ No ANTHROPIC_API_KEY or CLAUDE_API_KEY env var — cannot generate PAA fallback")
+        return []
+    print(f"[PAA_FALLBACK] 🔑 Using Anthropic API key ({api_key[:8]}...)")
+    try:
+        import anthropic as _anthropic
+        client = _anthropic.Anthropic(api_key=api_key)
+
+        # Zbierz kontekst z SERP
+        snippets = []
+        for r in (serp_data.get("organic_results") or [])[:6]:
+            t = r.get("title", "")
+            s = r.get("snippet", "")
+            if t or s:
+                snippets.append(f"- {t}: {s}")
+
+        ai_ov = serp_data.get("ai_overview", {})
+        ai_text = ""
+        if isinstance(ai_ov, dict):
+            ai_text = ai_ov.get("text", "") or ""
+        elif isinstance(ai_ov, str):
+            ai_text = ai_ov
+
+        context = "\n".join(snippets[:6])
+        if ai_text:
+            context = "AI Overview: " + ai_text[:300] + "\n\n" + context
+
+        prompt = (
+            f"Dla frazy: \"{keyword}\"\n"
+            f"Kontekst z Google:\n{context[:1500]}\n\n"
+            "Wygeneruj 6 pytań które użytkownicy zadają w sekcji \"Ludzie pytają też\" (People Also Ask) na Google.\n"
+            "Pytania muszą być po polsku, konkretne, rzeczowe.\n"
+            "Zwróć TYLKO JSON array: [{\"question\": \"...\", \"answer\": \"...\"}]\n"
+            "Każda odpowiedź 1-2 zdania."
+        )
+
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=800,
+            temperature=0,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = resp.content[0].text.strip()
+        import re as _re
+        m = _re.search(r"\[[\s\S]*\]", text)
+        if m:
+            questions = _json.loads(m.group())
+            return [{"question": q.get("question",""), "answer": q.get("answer",""), "source": "claude_fallback"} for q in questions if q.get("question")]
+    except Exception as e:
+        print(f"[PAA_FALLBACK] Error: {e}")
     return []
 
 
@@ -983,7 +998,7 @@ def perform_ngram_analysis():
 
     results = sorted(results, key=lambda x: x["weight"], reverse=True)[:top_n]
 
-    # 2️⃣ Semantyka (TF-IDF — v56.0, replaces Gemini Flash)
+    # 2️⃣ Semantyka (Gemini Flash)
     full_text_sample = " ".join(all_text_content)[:15000]
     semantic_keyphrases = extract_semantic_keyphrases_tfidf(full_text_sample)
 
@@ -1208,35 +1223,15 @@ def perform_ngram_analysis():
             "causal_triplets_found": causal_data.get("count", 0) if causal_data else 0,
             "content_gaps_found": content_gaps_data.get("total_gaps", 0) if content_gaps_data else 0,
             "recommended_length": recommended_length,
-            "engine": "v55.0",
+            "engine": "v56.0",
             "lsi_candidates": len(semantic_keyphrases),
         }
     }
 
-    # 3️⃣ Firestore Save (optional)
+    # 3️⃣ Firestore REMOVED (v56.0) — data returned via JSON response only
     if project_id:
-        try:
-            db = firestore.client()
-            doc_ref = db.collection("seo_projects").document(project_id)
-            if doc_ref.get().exists:
-                avg_len = (
-                    sum(len(t.split()) for t in all_text_content) // len(all_text_content)
-                    if all_text_content else 0
-                )
-                doc_ref.update({
-                    "s1_data": response_payload,
-                    "lsi_enrichment": {"enabled": True, "count": len(semantic_keyphrases)},
-                    "avg_competitor_length": avg_len,
-                    "updated_at": firestore.SERVER_TIMESTAMP
-                })
-                response_payload["saved_to_firestore"] = True
-                print(f"[S1] ✅ Wyniki n-gramów zapisane do Firestore → {project_id}")
-            else:
-                response_payload["saved_to_firestore"] = False
-                print(f"[S1] ⚠️ Nie znaleziono projektu {project_id}")
-        except Exception as e:
-            print(f"[S1] ❌ Firestore error: {e}")
-            response_payload["firestore_error"] = str(e)
+        response_payload["saved_to_firestore"] = False
+        print(f"[S1] ℹ️ Firestore disabled — project_id {project_id} ignored")
 
     return jsonify(response_payload)
 
@@ -1370,7 +1365,7 @@ def handle_exception(e):
 def health():
     return jsonify({
         "status": "ok",
-        "engine": "v55.0",
+        "engine": "v56.0",
         "limits": {
             "max_content_per_page": MAX_CONTENT_SIZE,
             "max_total_content": MAX_TOTAL_CONTENT,
@@ -1378,7 +1373,7 @@ def health():
             "skip_domains": SKIP_DOMAINS
         },
         "features": {
-            "gemini_enabled": bool(GEMINI_API_KEY),
+            "tfidf_semantic_enabled": True,
             "serpapi_enabled": bool(SERPAPI_KEY),
             "dataforseo_enabled": DATAFORSEO_ENABLED,
             "serp_provider": SERP_PROVIDER,
