@@ -528,6 +528,22 @@ def _fetch_serpapi_data(keyword, num_results=10):
     if related_searches:
         print(f"[S1/SerpAPI] ✅ {len(related_searches)} related searches")
 
+    # ── v60: Refinement Chips (search intent filters at top of SERP) ──
+    refinement_chips = []
+    for rc in serp_data.get("refine_this_search", []):
+        if isinstance(rc, dict):
+            query = rc.get("query", "").strip()
+            if query and len(query) > 1:
+                refinement_chips.append(query)
+    # Also check inline_searches (alternative SerpAPI field)
+    for rc in serp_data.get("inline_searches", []):
+        if isinstance(rc, dict):
+            title = rc.get("title", "").strip()
+            if title and title not in refinement_chips:
+                refinement_chips.append(title)
+    if refinement_chips:
+        print(f"[S1/SerpAPI] ✅ {len(refinement_chips)} refinement chips: {refinement_chips[:6]}")
+
     # ── Organic Results (titles + snippets + URLs for scraping) ──
     organic_results = serp_data.get("organic_results", [])
     serp_titles = []
@@ -547,6 +563,7 @@ def _fetch_serpapi_data(keyword, num_results=10):
         "featured_snippet": featured_snippet,
         "ai_overview": ai_overview,
         "related_searches": related_searches,
+        "refinement_chips": refinement_chips,
         "serp_titles": serp_titles,
         "serp_snippets": serp_snippets,
         "organic_results": organic_results,
@@ -575,6 +592,7 @@ def fetch_serp_sources(keyword, num_results=10):
         "featured_snippet": None,
         "ai_overview": None,
         "related_searches": [],
+        "refinement_chips": [],
         "serp_titles": [],
         "serp_snippets": []
     }
@@ -632,6 +650,7 @@ def fetch_serp_sources(keyword, num_results=10):
         featured_snippet = serp_metadata.get("featured_snippet")
         ai_overview = serp_metadata.get("ai_overview")
         related_searches = serp_metadata.get("related_searches", [])
+        refinement_chips = serp_metadata.get("refinement_chips", [])
         serp_titles = serp_metadata.get("serp_titles", [])
         serp_snippets = serp_metadata.get("serp_snippets", [])
 
@@ -869,6 +888,7 @@ def fetch_serp_sources(keyword, num_results=10):
             "featured_snippet": featured_snippet,
             "ai_overview": ai_overview,  # v27.0
             "related_searches": related_searches,
+            "refinement_chips": refinement_chips,  # v60: Google search refinement chips
             "serp_titles": serp_titles,
             "serp_snippets": serp_snippets
         }
@@ -896,6 +916,7 @@ def perform_ngram_analysis():
     featured_snippet = None
     ai_overview = None  # v27.0: Google SGE
     related_searches = []
+    refinement_chips = []  # v60: Google search refinement chips
     serp_titles = []
     serp_snippets = []
     h2_patterns = []
@@ -914,6 +935,7 @@ def perform_ngram_analysis():
         featured_snippet = serp_result.get("featured_snippet")
         ai_overview = serp_result.get("ai_overview")  # v27.0
         related_searches = serp_result.get("related_searches", [])
+        refinement_chips = serp_result.get("refinement_chips", [])  # v60: Google chips
         serp_titles = serp_result.get("serp_titles", [])
         serp_snippets = serp_result.get("serp_snippets", [])
 
@@ -1119,6 +1141,7 @@ def perform_ngram_analysis():
         "featured_snippet": featured_snippet,
         "ai_overview": ai_overview,  # v27.0: Google SGE
         "related_searches": related_searches,
+        "refinement_chips": refinement_chips,  # v60: Google search refinement chips
         "competitor_titles": serp_titles[:10],
         "competitor_snippets": serp_snippets[:10],
         "competitor_h2_patterns": unique_h2_patterns,
