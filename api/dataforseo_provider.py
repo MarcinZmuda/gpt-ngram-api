@@ -136,6 +136,8 @@ def fetch_serp_data(keyword, num_results=10, location_code=2616, language_code="
         organic_results_raw = []
 
         for item in items:
+            if not isinstance(item, dict):
+                continue
             item_type = item.get("type", "")
 
             # ── Organic Results ──
@@ -297,9 +299,13 @@ def fetch_serp_data(keyword, num_results=10, location_code=2616, language_code="
             elif item_type == "related_searches":
                 rs_items = item.get("items", [])
                 for rs in rs_items:
-                    query = rs.get("title", "")
-                    if query:
-                        related_searches.append(query)
+                    if isinstance(rs, str):
+                        if rs.strip():
+                            related_searches.append(rs.strip())
+                    elif isinstance(rs, dict):
+                        query = rs.get("title", "")
+                        if query:
+                            related_searches.append(query)
 
         # Log summary
         print(f"[DataForSEO] ✅ Parsed: {len(organic_results_raw)} organic, "
@@ -368,21 +374,24 @@ def fetch_raw_debug(keyword, location_code=2616, language_code="pl"):
     result = results[0] if results else {}
     items = result.get("items", [])
 
+    # Filter out non-dict items (DataForSEO can return strings in edge cases)
+    dict_items = [it for it in items if isinstance(it, dict)]
+
     item_types_count = {}
-    for it in items:
+    for it in dict_items:
         t = it.get("type", "unknown")
         item_types_count[t] = item_types_count.get(t, 0) + 1
 
     # Find PAA items
     paa_items = []
-    for it in items:
+    for it in dict_items:
         if it.get("type") == "people_also_ask":
             paa_items = it.get("items", [])
             break
 
     # Find AI Overview
     aio_item = None
-    for it in items:
+    for it in dict_items:
         if it.get("type") == "ai_overview":
             aio_item = it
             break
@@ -393,16 +402,16 @@ def fetch_raw_debug(keyword, location_code=2616, language_code="pl"):
         "status_message": raw.get("status_message"),
         "cost": raw.get("cost"),
         "task_status": task.get("status_code"),
-        "total_items": len(items),
+        "total_items": len(dict_items),
         "item_types": item_types_count,
-        "has_people_also_ask": "people_also_ask" in [i.get("type") for i in items],
+        "has_people_also_ask": "people_also_ask" in [i.get("type") for i in dict_items],
         "paa_count": len(paa_items),
-        "paa_questions": [p.get("title", "") for p in paa_items[:10]],
+        "paa_questions": [p.get("title", "") for p in paa_items[:10] if isinstance(p, dict)],
         "has_ai_overview": aio_item is not None,
         "ai_overview_items_count": len(aio_item.get("items", [])) if aio_item else 0,
         "ai_overview_refs_count": len(aio_item.get("references", [])) if aio_item else 0,
-        "has_featured_snippet": "featured_snippet" in [i.get("type") for i in items],
-        "has_related_searches": "related_searches" in [i.get("type") for i in items],
-        "organic_count": sum(1 for i in items if i.get("type") == "organic"),
-        "organic_titles": [i.get("title", "") for i in items if i.get("type") == "organic"][:5],
+        "has_featured_snippet": "featured_snippet" in [i.get("type") for i in dict_items],
+        "has_related_searches": "related_searches" in [i.get("type") for i in dict_items],
+        "organic_count": sum(1 for i in dict_items if i.get("type") == "organic"),
+        "organic_titles": [i.get("title", "") for i in dict_items if i.get("type") == "organic"][:5],
     }
