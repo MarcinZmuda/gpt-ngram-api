@@ -1,37 +1,36 @@
 """
 ===============================================================================
-🔗 CAUSAL TRIPLET EXTRACTOR v1.0
+🔗 CAUSAL TRIPLET EXTRACTOR v2.0 (LLM-based)
 ===============================================================================
-Wyciąga łańcuchy przyczynowo-skutkowe z treści konkurencji.
+v1.0: Regex-based — missed ~90% of causal relations in real text because
+      Polish legal/medical prose doesn't follow "X powoduje Y" patterns.
 
-Istniejący entity_extractor.py wyciąga FAKTYCZNE relacje:
-  sąd — ustala — miejsce pobytu
-  leczenie — poprawia — rokowania
-
-Ten moduł dodaje KAUZALNE relacje:
-  brak alimentów — powoduje → postępowanie egzekucyjne
-  mutacja genu SHOX — prowadzi do → niedobór wzrostu
-
-DLACZEGO:
-Google mierzy "explanatory depth" od Helpful Content Update 2023.
-Artykuły z łańcuchami przyczynowymi (WHY, nie tylko WHAT) rankują wyżej,
-bo odpowiadają na ~30% pytań PAA typu "dlaczego" / "co się stanie jeśli".
+v2.0: LLM-based via OpenAI gpt-4.1-mini (same pattern as PAA fallback).
+      Sends combined competitor text → gets structured causal relations.
+      Cost: ~$0.002 per call (2-3K input tokens, 300 output tokens).
 
 Integracja: index.py → po entity_seo → dodaje "causal_triplets" do response
-
-Autor: BRAJEN Team
-Data: 2025
 ===============================================================================
 """
 
+import os
 import re
-from typing import List, Dict, Optional, Tuple, Set
-from collections import defaultdict
+import json
+import logging
+from typing import List, Dict
 from dataclasses import dataclass, asdict
+from collections import defaultdict
+
+logger = logging.getLogger(__name__)
+
+try:
+    import requests as _requests
+except ImportError:
+    _requests = None
 
 
 # ================================================================
-# 📦 STRUKTURY DANYCH
+# STRUKTURY DANYCH
 # ================================================================
 
 @dataclass
@@ -41,76 +40,15 @@ class CausalTriplet:
     effect: str
     relation_type: str      # "causes", "prevents", "requires", "enables", "leads_to"
     confidence: float       # 0.0-1.0
-    source_sentence: str    # zdanie źródłowe
-    is_chain: bool = False  # czy element łańcucha A→B→C
+    source_sentence: str    # opis relacji
+    is_chain: bool = False  # czy element lancucha A->B->C
 
     def to_dict(self) -> Dict:
         return asdict(self)
 
 
 # ================================================================
-# 🔍 WZORCE KAUZALNE (POLSKI)
-# ================================================================
-
-# Każdy tuple: (regex, typ_relacji, kierunek)
-# kierunek: "forward" = match[0]=cause, match[1]=effect
-#           "reverse" = match[0]=effect, match[1]=cause
-
-CAUSAL_PATTERNS_PL = [
-    # ═══ BEZPOŚREDNIA PRZYCZYNA ═══
-    (r'(.{10,80}?)\s+(?:powoduje|wywołuje|skutkuje|prowadzi do|doprowadza do)\s+(.{10,80})',
-     "causes", "forward"),
-    (r'(.{10,80}?)\s+(?:jest przyczyną|jest powodem|stanowi przyczynę)\s+(.{10,80})',
-     "causes", "forward"),
-    (r'(.{10,80}?)\s+(?:może skutkować|może prowadzić do|grozi)\s+(.{10,80})',
-     "may_cause", "forward"),
-
-    # ═══ SKUTEK / KONSEKWENCJA ═══
-    (r'(?:[Ww] wyniku|[Nn]a skutek|[Ww]skutek|[Ww] rezultacie)\s+(.{10,80}?)\s+(.{10,80})',
-     "results_from", "reverse"),
-    (r'(.{10,80}?)\s+(?:w efekcie|w konsekwencji|w następstwie)\s+(.{10,80})',
-     "causes", "forward"),
-
-    # ═══ PREWENCJA ═══
-    (r'(.{10,80}?)\s+(?:zapobiega|chroni przed|przeciwdziała|zmniejsza ryzyko)\s+(.{10,80})',
-     "prevents", "forward"),
-    (r'(.{10,80}?)\s+(?:minimalizuje|ogranicza|redukuje prawdopodobieństwo)\s+(.{10,80})',
-     "prevents", "forward"),
-
-    # ═══ WYMAGANIE / WARUNEK ═══
-    (r'(.{10,80}?)\s+(?:wymaga|jest konieczne do|warunkuje|jest niezbędne dla)\s+(.{10,80})',
-     "requires", "forward"),
-    (r'(?:[Aa]by|[Żż]eby)\s+(.{10,80}?),?\s+(?:trzeba|należy|konieczne jest|niezbędne jest)\s+(.{10,80})',
-     "required_for", "reverse"),
-    (r'(?:[Ww]arunkiem)\s+(.{10,80}?)\s+(?:jest)\s+(.{10,80})',
-     "requires", "reverse"),
-
-    # ═══ UMOŻLIWIENIE ═══
-    (r'(.{10,80}?)\s+(?:umożliwia|pozwala na|otwiera drogę do|daje podstawę do)\s+(.{10,80})',
-     "enables", "forward"),
-    (r'(?:[Dd]zięki)\s+(.{10,80}?)\s+(?:można|możliwe jest|da się)\s+(.{10,80})',
-     "enables", "forward"),
-
-    # ═══ PRAWNE (specyficzne) ═══
-    (r'(?:[Bb]rak|[Nn]iedopełnienie|[Zz]aniechanie)\s+(.{10,80}?)\s+(?:skutkuje|grozi|prowadzi do)\s+(.{10,80})',
-     "omission_causes", "forward"),
-    (r'(?:[Zz]łożenie|[Ww]niesienie|[Dd]oręczenie)\s+(.{10,80}?)\s+(?:rozpoczyna|wszczyna|otwiera|uruchamia)\s+(.{10,80})',
-     "initiates", "forward"),
-    (r'(?:[Pp]rawomocność|[Uu]prawomocnienie)\s+(.{10,80}?)\s+(?:oznacza|skutkuje|powoduje)\s+(.{10,80})',
-     "causes", "forward"),
-
-    # ═══ MEDYCZNE (specyficzne) ═══
-    (r'(?:[Nn]ieleczon[aey]|[Zz]aniedbani[ea])\s+(.{10,80}?)\s+(?:prowadzi do|grozi|może skutkować)\s+(.{10,80})',
-     "untreated_causes", "forward"),
-    (r'(.{10,80}?)\s+(?:łagodzi|redukuje|eliminuje)\s+(?:objawy|symptomy|skutki)\s+(.{10,80})',
-     "treats", "forward"),
-    (r'(?:[Dd]eficyt|[Nn]iedobór)\s+(.{10,80}?)\s+(?:prowadzi do|powoduje|skutkuje)\s+(.{10,80})',
-     "deficiency_causes", "forward"),
-]
-
-
-# ================================================================
-# 📊 EKSTRAKCJA
+# EKSTRAKCJA (LLM-based)
 # ================================================================
 
 def extract_causal_triplets(
@@ -119,147 +57,157 @@ def extract_causal_triplets(
     max_triplets: int = 15
 ) -> List[CausalTriplet]:
     """
-    Wyciąga kauzalne triplety z treści konkurencji.
+    Wyciaga kauzalne triplety z tresci konkurencji przez LLM.
 
-    Pipeline:
-    1. Regex extraction z CAUSAL_PATTERNS_PL
-    2. Filtracja po relevance do main_keyword
-    3. Budowanie łańcuchów (A→B + B→C = chain)
-    4. Ranking po importance
-
-    Args:
-        texts: Lista treści konkurencji
-        main_keyword: Główna fraza kluczowa
-        max_triplets: Max liczba tripletów
-
-    Returns:
-        Lista CausalTriplet posortowana po ważności
+    v2.0: Zamiast regex, wysyla streszczony tekst do gpt-4.1-mini
+    i prosi o strukturalne relacje przyczynowo-skutkowe.
     """
-    # Połącz treści (z limitem)
-    combined = " ".join(t[:30000] for t in texts if t)
-    if not combined.strip():
+    if not texts or not main_keyword:
         return []
 
-    raw_triplets = []
-    kw_lower = main_keyword.lower()
-    kw_words = set(w for w in kw_lower.split() if len(w) > 3)
+    # Combine texts with limit (~8K chars for context)
+    combined = ""
+    for t in texts:
+        if t and len(combined) < 8000:
+            chunk = t.strip()[:3000]
+            if len(chunk) > 100:
+                combined += chunk + "\n---\n"
 
-    for pattern, rel_type, direction in CAUSAL_PATTERNS_PL:
-        try:
-            matches = re.findall(pattern, combined, re.IGNORECASE)
-        except re.error:
-            continue
+    if len(combined) < 200:
+        logger.warning("[CAUSAL_V2] Combined text too short, skipping")
+        return []
 
-        for match in matches:
-            if len(match) < 2:
+    # LLM extraction
+    triplets = _extract_via_llm(combined, main_keyword, max_triplets)
+
+    if triplets:
+        _build_chains(triplets)
+        triplets.sort(key=lambda t: (-int(t.is_chain), -t.confidence))
+        logger.info(f"[CAUSAL_V2] LLM extracted {len(triplets)} triplets "
+                    f"({sum(1 for t in triplets if t.is_chain)} chains)")
+
+    return triplets[:max_triplets]
+
+
+def _extract_via_llm(
+    text: str,
+    main_keyword: str,
+    max_triplets: int
+) -> List[CausalTriplet]:
+    """Extract causal relations via OpenAI gpt-4.1-mini."""
+
+    oai_key = os.getenv("OPENAI_API_KEY")
+    if not oai_key:
+        logger.warning("[CAUSAL_V2] OPENAI_API_KEY not set")
+        return []
+
+    if not _requests:
+        logger.warning("[CAUSAL_V2] requests module not available")
+        return []
+
+    prompt = (
+        f'Przeanalizuj ponizszy tekst z perspektywy tematu "{main_keyword}".\n\n'
+        f'Znajdz {max_triplets} najwazniejszych relacji przyczynowo-skutkowych '
+        f'(co powoduje co, co z czego wynika, co do czego prowadzi, co czemu zapobiega, '
+        f'co jest wymagane do czego).\n\n'
+        f'Odpowiedz TYLKO w formacie JSON — tablica obiektow:\n'
+        f'[\n'
+        f'  {{"cause": "przyczyna", "effect": "skutek", '
+        f'"type": "causes|prevents|requires|enables|leads_to", "confidence": 0.8}}\n'
+        f']\n\n'
+        f'Zasady:\n'
+        f'- Wyciagaj relacje FAKTYCZNIE obecne w tekscie, nie wymyslaj\n'
+        f'- cause i effect: krotkie frazy (5-50 znakow), nie cale zdania\n'
+        f'- confidence: 0.6-0.95 (wyzej = jasniej wyrazone w tekscie)\n'
+        f'- Skup sie na relacjach istotnych dla "{main_keyword}"\n'
+        f'- Zero komentarzy, TYLKO tablica JSON\n\n'
+        f'TEKST:\n{text[:6000]}'
+    )
+
+    try:
+        resp = _requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {oai_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "gpt-4.1-mini",
+                "max_tokens": 800,
+                "temperature": 0.1,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=20,
+        )
+
+        if resp.status_code != 200:
+            logger.warning(f"[CAUSAL_V2] OpenAI API error: {resp.status_code}")
+            return []
+
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
+
+        # Parse JSON — handle markdown code blocks
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+
+        # Find JSON array
+        json_match = re.search(r'\[[\s\S]*\]', raw)
+        if not json_match:
+            logger.warning(f"[CAUSAL_V2] No JSON array in response: {raw[:200]}")
+            return []
+
+        data = json.loads(json_match.group())
+
+        valid_types = {"causes", "prevents", "requires", "enables", "leads_to",
+                       "may_cause", "results_from", "initiates", "treats"}
+
+        triplets = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            cause = str(item.get("cause", "")).strip()
+            effect = str(item.get("effect", "")).strip()
+            rel_type = str(item.get("type", "causes")).strip()
+            confidence = float(item.get("confidence", 0.7))
+
+            if not cause or not effect or len(cause) < 3 or len(effect) < 3:
                 continue
 
-            # Wyciągnij cause/effect w zależności od kierunku
-            if direction == "forward":
-                cause_raw = match[0].strip()
-                effect_raw = match[1].strip()
-            else:
-                cause_raw = match[1].strip()
-                effect_raw = match[0].strip()
+            if rel_type not in valid_types:
+                rel_type = "causes"
 
-            # Oczyszczenie
-            cause = _clean_triplet_part(cause_raw)
-            effect = _clean_triplet_part(effect_raw)
-
-            # Filtracja szumu
-            if not cause or not effect:
-                continue
-            if len(cause) < 5 or len(effect) < 5:
-                continue
-            if len(cause) > 80 or len(effect) > 80:
-                continue
-            if cause.lower() == effect.lower():
-                continue
-
-            # Scoring — relevance do main_keyword
-            cause_lower = cause.lower()
-            effect_lower = effect.lower()
-            
-            relevance = 0.0
-            if kw_lower in cause_lower or kw_lower in effect_lower:
-                relevance = 0.9
-            elif kw_words and any(w in cause_lower or w in effect_lower for w in kw_words):
-                relevance = 0.6
-            else:
-                relevance = 0.3
-
-            raw_triplets.append(CausalTriplet(
-                cause=cause,
-                effect=effect,
+            triplets.append(CausalTriplet(
+                cause=cause[:80],
+                effect=effect[:80],
                 relation_type=rel_type,
-                confidence=relevance,
-                source_sentence=f"{cause} → {effect}"
+                confidence=min(0.95, max(0.3, confidence)),
+                source_sentence=f"{cause} -> {effect}",
             ))
 
-    # Deduplikacja
-    seen = set()
-    unique = []
-    for t in raw_triplets:
-        key = f"{t.cause[:25].lower()}|{t.effect[:25].lower()}"
-        if key not in seen:
-            seen.add(key)
-            unique.append(t)
+        return triplets
 
-    # Budowanie łańcuchów
-    _build_chains(unique)
-
-    # Sortowanie: chains first, potem confidence
-    unique.sort(key=lambda t: (-int(t.is_chain), -t.confidence))
-
-    return unique[:max_triplets]
+    except json.JSONDecodeError as e:
+        logger.warning(f"[CAUSAL_V2] JSON parse error: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"[CAUSAL_V2] LLM extraction error: {e}")
+        return []
 
 
-def _clean_triplet_part(text: str) -> str:
-    """Oczyszcza fragment tripletu.
-
-    v52.1: Dodatkowe filtry — odrzucamy ucięte/zaśmiecone fragmenty ze SERP:
-    - Usuwa HTML tagi i HTML entities
-    - Odrzuca fragmenty zaczynające się od małej litery (ucięty środek zdania)
-    - Odrzuca fragmenty z sekwencjami HTML/JS (\\r\\n, strong>, itp.)
-    """
-    # Usuń HTML tagi
-    text = re.sub(r'<[^>]+>', ' ', text)
-    # Usuń HTML entities (np. &Oacute;, &amp;, \u003c)
-    text = re.sub(r'&[A-Za-z]{2,8};', '', text)
-    text = re.sub(r'&#\d+;', '', text)
-    text = re.sub(r'\\u[0-9a-fA-F]{4}', '', text)
-    # Usuń leading/trailing interpunkcję
-    text = text.strip(' ,;:–—-"\'()[]')
-    # Usuń wielokrotne spacje
-    text = re.sub(r'\s+', ' ', text)
-    # Obetnij do pierwszego zdania
-    if '.' in text:
-        text = text.split('.')[0]
-    text = text.strip()
-
-    if not text:
-        return ""
-    # Odrzuć fragment zaczynający się od małej litery (ucięty środek zdania z HTML)
-    if text[0].islower():
-        return ""
-    # Odrzuć fragment z HTML/JS artefaktami
-    if re.search(r'\\r|\\n|strong>|<\/|\\u[0-9a-f]{4}', text, re.IGNORECASE):
-        return ""
-    return text
+# ================================================================
+# CHAIN BUILDER
+# ================================================================
 
 def _build_chains(triplets: List[CausalTriplet]) -> None:
     """
-    Oznacza triplety będące częścią łańcuchów.
-    Jeśli A→B i B→C istnieją, oba dostają is_chain=True.
+    Oznacza triplety bedace czescia lancuchow.
+    Jesli A->B i B->C istnieja, oba dostaja is_chain=True.
     """
-    # Zbuduj indeks: effect → triplet
     effect_index = defaultdict(list)
     for t in triplets:
-        # Kluczem są pierwsze 3 słowa efektu (przybliżone matchowanie)
         effect_key = " ".join(t.effect.lower().split()[:3])
         effect_index[effect_key].append(t)
 
-    # Sprawdź: czy cause jakiegoś tripletu jest effectem innego?
     for t in triplets:
         cause_key = " ".join(t.cause.lower().split()[:3])
         if cause_key in effect_index:
@@ -269,68 +217,61 @@ def _build_chains(triplets: List[CausalTriplet]) -> None:
 
 
 # ================================================================
-# 📝 FORMATOWANIE DLA AGENTA
+# FORMATOWANIE DLA AGENTA
 # ================================================================
 
 def format_causal_for_agent(
     triplets: List[CausalTriplet],
     main_keyword: str
 ) -> str:
-    """Formatuje kauzalne triplety jako instrukcję dla agenta GPT."""
+    """Formatuje kauzalne triplety jako instrukcje dla agenta GPT."""
     if not triplets:
         return ""
 
     lines = [
-        f"🔗 ŁAŃCUCHY PRZYCZYNOWO-SKUTKOWE — znalezione w top 10 dla \"{main_keyword}\":",
-        "Wpleć te relacje w artykuł (wyjaśniaj DLACZEGO, nie tylko CO):",
+        f'RELACJE PRZYCZYNOWO-SKUTKOWE z top 10 dla "{main_keyword}":',
+        "Wplec te relacje w artykul (wyjasniaj DLACZEGO, nie tylko CO):",
         ""
     ]
 
-    # Łańcuchy (najcenniejsze)
     chains = [t for t in triplets if t.is_chain]
     singles = [t for t in triplets if not t.is_chain]
 
     if chains:
-        lines.append("⛓️ ŁAŃCUCHY (A→B→C — najcenniejsze):")
+        lines.append("LANCUCHY (A->B->C):")
         for t in chains[:5]:
             rel_label = _relation_label(t.relation_type)
             lines.append(f"  {t.cause} {rel_label} {t.effect}")
         lines.append("")
 
     if singles:
-        lines.append("➡️ RELACJE KAUZALNE:")
+        lines.append("RELACJE KAUZALNE:")
         for t in singles[:8]:
             rel_label = _relation_label(t.relation_type)
             lines.append(f"  {t.cause} {rel_label} {t.effect}")
         lines.append("")
 
-    lines.append(
-        "💡 WSKAZÓWKA: Użyj tych relacji, żeby artykuł odpowiadał na pytania "
-        "\"dlaczego?\", \"co się stanie jeśli?\", \"jakie są konsekwencje?\". "
-        "Google to nagradza od Helpful Content Update."
-    )
-
     return "\n".join(lines)
 
 
 def _relation_label(rel_type: str) -> str:
-    """Zamienia typ relacji na czytelną etykietę."""
+    """Zamienia typ relacji na czytelna etykiete."""
     labels = {
-        "causes": "→ powoduje →",
-        "may_cause": "→ może powodować →",
-        "prevents": "→ zapobiega →",
-        "requires": "→ wymaga →",
-        "enables": "→ umożliwia →",
-        "results_from": "← wynika z ←",
-        "required_for": "→ jest wymagane do →",
-        "omission_causes": "→ [brak] skutkuje →",
-        "initiates": "→ rozpoczyna →",
-        "untreated_causes": "→ [nieleczone] prowadzi do →",
-        "treats": "→ łagodzi →",
-        "deficiency_causes": "→ [niedobór] powoduje →",
-        "leads_to": "→ prowadzi do →",
+        "causes": "-> powoduje ->",
+        "may_cause": "-> moze powodowac ->",
+        "prevents": "-> zapobiega ->",
+        "requires": "-> wymaga ->",
+        "enables": "-> umozliwia ->",
+        "results_from": "<- wynika z <-",
+        "required_for": "-> jest wymagane do ->",
+        "omission_causes": "-> [brak] skutkuje ->",
+        "initiates": "-> rozpoczyna ->",
+        "untreated_causes": "-> [nieleczone] prowadzi do ->",
+        "treats": "-> lagodzi ->",
+        "deficiency_causes": "-> [niedobor] powoduje ->",
+        "leads_to": "-> prowadzi do ->",
     }
-    return labels.get(rel_type, "→")
+    return labels.get(rel_type, "->")
 
 
 # ================================================================
