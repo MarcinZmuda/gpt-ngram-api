@@ -303,8 +303,10 @@ def extract_entities(
         if not text or len(text) < 100:
             continue
         
-        text_sample = text[:50000]
-        
+        # v2.2: Clean CSS/JS artifacts BEFORE spaCy NER
+        text_clean = _clean_text_for_nlp(text) if text else text
+        text_sample = text_clean[:50000]
+
         try:
             doc = nlp(text_sample)
             
