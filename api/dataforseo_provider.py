@@ -217,12 +217,16 @@ def fetch_serp_data(keyword, num_results=10, location_code=2616, language_code="
             # ── Featured Snippet ──
             elif item_type == "featured_snippet":
                 fs_desc = item.get("description", "")
+                fs_featured_title = item.get("featured_title", "")
                 fs_title = item.get("title", "")
                 fs_url = item.get("url", "")
+                # v55.1: featured_title = wyróżniona odpowiedź, description = opis
+                answer = fs_featured_title or fs_desc
                 featured_snippet = {
-                    "type": item.get("featured_snippet", {}).get("type", "paragraph") if isinstance(item.get("featured_snippet"), dict) else "paragraph",
+                    "type": "paragraph",
                     "title": fs_title,
-                    "answer": fs_desc,
+                    "answer": answer,
+                    "description": fs_desc,
                     "source": fs_url,
                     "displayed_link": item.get("breadcrumb", ""),
                 }
