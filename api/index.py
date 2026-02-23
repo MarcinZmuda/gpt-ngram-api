@@ -10,7 +10,8 @@ try:
 except ImportError:
     spacy = None
     SPACY_AVAILABLE = False
-import google.generativeai as genai
+# v56.0: Removed google-generativeai — semantic keyphrases now extracted via TF-IDF (scikit-learn)
+from sklearn.feature_extraction.text import TfidfVectorizer
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -78,14 +79,9 @@ if not firebase_admin._apps:
         print(f"[S1] ⚠️ Firebase init skipped: {e}")
 
 # ======================================================
-# ⚙️ Gemini (Google Generative AI) Configuration
+# ⚙️ v56.0: Semantic keyphrases via TF-IDF (no external AI)
 # ======================================================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    print("[S1] ✅ Gemini API configured")
-else:
-    print("[S1] ⚠️ GEMINI_API_KEY not set — semantic extraction fallback active")
+print("[S1] ✅ Semantic keyphrases: TF-IDF extractor (scikit-learn)")
 
 # ======================================================
 # 🧠 Import local modules (compatible with both local and Render)
@@ -156,26 +152,72 @@ def should_skip_url(url):
     return False
 
 # ======================================================
-# 🧠 Helper: Semantic extraction using Gemini Flash
+# 🧠 Helper: Semantic extraction using TF-IDF (v56.0 — replaces Gemini)
 # ======================================================
-def extract_semantic_tags_gemini(text, top_n=10):
-    """Używa Google Gemini Flash do wyciągnięcia fraz semantycznych."""
-    if not GEMINI_API_KEY or not (text or "").strip():
+# Polish stop words for TF-IDF filtering
+_TFIDF_STOP_PL = [
+    "i", "w", "na", "z", "do", "że", "się", "nie", "to", "jest", "za", "po",
+    "od", "o", "jak", "ale", "co", "ten", "tym", "być", "może", "już", "tak",
+    "gdy", "lub", "czy", "tego", "tej", "są", "dla", "ich", "przez", "jako",
+    "te", "ze", "tych", "było", "ma", "przy", "które", "który", "która",
+    "których", "jego", "jej", "także", "więc", "tylko", "też", "sobie",
+    "bardzo", "jeszcze", "wszystko", "przed", "między", "pod", "nad", "bez",
+    "oraz", "gdzie", "kiedy", "ile", "jeśli", "strona", "kliknij", "czytaj",
+]
+
+def extract_semantic_keyphrases_tfidf(text, top_n=10):
+    """
+    v56.0: Wyciąga frazy semantyczne z tekstu konkurencji za pomocą TF-IDF.
+    Zastępuje Gemini Flash — zero zależności od zewnętrznego AI, zero hallucynacji.
+    Zwraca format kompatybilny: [{"phrase": "...", "score": 0.xx}]
+    """
+    if not (text or "").strip():
         return []
 
     try:
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        prompt = f"""
-        Jesteś ekspertem SEO. Przeanalizuj poniższy tekst i wypisz {top_n} najważniejszych fraz kluczowych (semantic keywords), które najlepiej oddają jego sens.
-        Zwróć TYLKO listę po przecinku, bez numerowania.
+        # Split text into pseudo-documents (paragraphs) for meaningful TF-IDF
+        paragraphs = [p.strip() for p in re.split(r'\n{2,}|\.\s+', text[:15000]) if len(p.strip()) > 30]
+        if len(paragraphs) < 2:
+            # Fallback: split into chunks of ~200 words
+            words = text[:15000].split()
+            paragraphs = [" ".join(words[i:i+200]) for i in range(0, len(words), 150)]
 
-        TEKST: {text[:8000]}...
-        """
-        response = model.generate_content(prompt)
-        keywords = [k.strip() for k in (response.text or "").split(",") if k.strip()]
-        return [{"phrase": kw, "score": 0.95 - (i * 0.02)} for i, kw in enumerate(keywords[:top_n])]
+        if not paragraphs:
+            return []
+
+        vectorizer = TfidfVectorizer(
+            ngram_range=(2, 4),
+            max_features=500,
+            stop_words=_TFIDF_STOP_PL,
+            min_df=1,
+            max_df=0.95,
+            token_pattern=r'(?u)\b[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻ]{2,}\b',
+        )
+        tfidf_matrix = vectorizer.fit_transform(paragraphs)
+        feature_names = vectorizer.get_feature_names_out()
+
+        # Average TF-IDF across all paragraphs (important phrases appear broadly)
+        avg_scores = tfidf_matrix.mean(axis=0).A1
+        top_indices = avg_scores.argsort()[::-1]
+
+        results = []
+        seen_lemmas = set()
+        for idx in top_indices:
+            phrase = feature_names[idx]
+            # Skip near-duplicates (one phrase is substring of another already added)
+            lower = phrase.lower()
+            if any(lower in s or s in lower for s in seen_lemmas):
+                continue
+            seen_lemmas.add(lower)
+            score = round(min(0.95, float(avg_scores[idx]) * 3), 3)
+            results.append({"phrase": phrase, "score": score})
+            if len(results) >= top_n:
+                break
+
+        print(f"[S1] ✅ TF-IDF semantic keyphrases: {len(results)} extracted")
+        return results
     except Exception as e:
-        print(f"[S1] ❌ Gemini Semantic Error: {e}")
+        print(f"[S1] ❌ TF-IDF Semantic Error: {e}")
         return []
 
 # ======================================================
@@ -259,61 +301,11 @@ def generate_content_hints(serp_analysis, main_keyword):
 # ======================================================
 def _generate_paa_claude_fallback(keyword: str, serp_data: dict) -> list:
     """
-    Fallback: gdy SerpAPI nie zwróci related_questions,
-    generuj PAA z Claude na podstawie keyword + snippetów SERP.
+    v56.0: PAA fallback — removed Anthropic dependency.
+    DataForSEO and SerpAPI both provide PAA natively.
+    Returns empty list — caller handles gracefully.
     """
-    import os as _os, json as _json
-    api_key = _os.getenv("ANTHROPIC_API_KEY") or _os.getenv("CLAUDE_API_KEY")
-    if not api_key:
-        print("[PAA_FALLBACK] ❌ No ANTHROPIC_API_KEY or CLAUDE_API_KEY env var — cannot generate PAA fallback")
-        return []
-    print(f"[PAA_FALLBACK] 🔑 Using Anthropic API key ({api_key[:8]}...)")
-    try:
-        import anthropic as _anthropic
-        client = _anthropic.Anthropic(api_key=api_key)
-
-        # Zbierz kontekst z SERP
-        snippets = []
-        for r in (serp_data.get("organic_results") or [])[:6]:
-            t = r.get("title", "")
-            s = r.get("snippet", "")
-            if t or s:
-                snippets.append(f"- {t}: {s}")
-
-        ai_ov = serp_data.get("ai_overview", {})
-        ai_text = ""
-        if isinstance(ai_ov, dict):
-            ai_text = ai_ov.get("text", "") or ""
-        elif isinstance(ai_ov, str):
-            ai_text = ai_ov
-
-        context = "\n".join(snippets[:6])
-        if ai_text:
-            context = "AI Overview: " + ai_text[:300] + "\n\n" + context
-
-        prompt = (
-            f"Dla frazy: \"{keyword}\"\n"
-            f"Kontekst z Google:\n{context[:1500]}\n\n"
-            "Wygeneruj 6 pytań które użytkownicy zadają w sekcji \"Ludzie pytają też\" (People Also Ask) na Google.\n"
-            "Pytania muszą być po polsku, konkretne, rzeczowe.\n"
-            "Zwróć TYLKO JSON array: [{\"question\": \"...\", \"answer\": \"...\"}]\n"
-            "Każda odpowiedź 1-2 zdania."
-        )
-
-        resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=800,
-            temperature=0,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        text = resp.content[0].text.strip()
-        import re as _re
-        m = _re.search(r"\[[\s\S]*\]", text)
-        if m:
-            questions = _json.loads(m.group())
-            return [{"question": q.get("question",""), "answer": q.get("answer",""), "source": "claude_fallback"} for q in questions if q.get("question")]
-    except Exception as e:
-        print(f"[PAA_FALLBACK] Error: {e}")
+    print(f"[PAA_FALLBACK] ℹ️ No PAA from SERP providers for '{keyword}' — skipping (AI fallback removed in v56.0)")
     return []
 
 
@@ -991,9 +983,9 @@ def perform_ngram_analysis():
 
     results = sorted(results, key=lambda x: x["weight"], reverse=True)[:top_n]
 
-    # 2️⃣ Semantyka (Gemini Flash)
+    # 2️⃣ Semantyka (TF-IDF — v56.0, replaces Gemini Flash)
     full_text_sample = " ".join(all_text_content)[:15000]
-    semantic_keyphrases = extract_semantic_tags_gemini(full_text_sample)
+    semantic_keyphrases = extract_semantic_keyphrases_tfidf(full_text_sample)
 
     # ⭐ H2 konkurencji z CZĘSTOŚCIĄ (ile stron używa danego wzorca)
     # Liczymy per source żeby H2 z 1 strony nie zdominowało przez repetycje
