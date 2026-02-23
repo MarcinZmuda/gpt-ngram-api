@@ -574,7 +574,14 @@ def fetch_serp_sources(keyword, num_results=10):
         # ── PAA Claude fallback (if no PAA from any provider) ──
         if not paa_questions:
             print(f"[S1] ⚠️ No PAA from {provider_used} — generating with Claude fallback...")
+            # v55.1: Fix — DataForSEO nie zwraca _serp_data, budujemy kontekst z dostępnych danych
             serp_data_for_fallback = serp_metadata.get("_serp_data", {})
+            if not serp_data_for_fallback:
+                # Zbuduj kontekst z danych DataForSEO/innego providera
+                serp_data_for_fallback = {
+                    "organic_results": serp_metadata.get("organic_results_raw") or serp_metadata.get("organic_results", []),
+                    "ai_overview": serp_metadata.get("ai_overview"),
+                }
             paa_questions = _generate_paa_claude_fallback(keyword, serp_data_for_fallback)
             if paa_questions:
                 print(f"[S1] ✅ Claude PAA fallback: {len(paa_questions)} questions generated")
@@ -773,8 +780,8 @@ def perform_ngram_analysis():
 
         if not sources:
             return jsonify({
-                "error": "Nie udało się pobrać źródeł z SerpAPI",
-                "hint": "Sprawdź czy SERPAPI_KEY jest ustawiony i ważny",
+                "error": f"Nie udało się pobrać źródeł z SERP ({SERP_PROVIDER})",
+                "hint": "Sprawdź konfigurację SERP providera (DATAFORSEO_LOGIN/PASSWORD lub SERPAPI_KEY)",
                 "main_keyword": main_keyword,
                 "paa": paa_questions,
                 "related_searches": related_searches
