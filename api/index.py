@@ -334,7 +334,8 @@ def _generate_paa_claude_fallback(keyword: str, serp_data: dict) -> list:
     # Try Anthropic first, then OpenAI
     raw = _paa_call_anthropic(_prompt, keyword) or _paa_call_openai(_prompt, keyword)
     if not raw:
-        return []
+        # v59.1: Pattern-based fallback when no API keys configured
+        return _paa_pattern_fallback(keyword)
 
     questions = []
     for line in raw.splitlines():
@@ -411,6 +412,32 @@ def _paa_call_openai(prompt: str, keyword: str) -> str:
     except Exception as e:
         print(f"[PAA_FALLBACK] ⚠️ OpenAI PAA error: {e}")
         return ""
+
+
+def _paa_pattern_fallback(keyword: str) -> list:
+    """Generate basic PAA questions from keyword patterns when no API keys available.
+    
+    v59.1: Better than 0 PAA. Uses Polish question templates
+    to generate contextually relevant questions.
+    """
+    patterns = [
+        f"Czym jest {keyword}?",
+        f"Jakie są konsekwencje {keyword}?",
+        f"Ile kosztuje {keyword}?",
+        f"Jak przebiega {keyword}?",
+        f"Co grozi za {keyword}?",
+        f"Kiedy dochodzi do {keyword}?",
+        f"Jak uniknąć {keyword}?",
+        f"Gdzie zgłosić {keyword}?",
+    ]
+    
+    questions = [
+        {"question": q, "answer": "", "source": "", "title": "", "generated": True}
+        for q in patterns[:6]
+    ]
+    
+    print(f"[PAA_FALLBACK] ℹ️ Pattern-based: generated {len(questions)} PAA for '{keyword}' (no API keys)")
+    return questions
 
 
 def _fetch_serpapi_data(keyword, num_results=10):
