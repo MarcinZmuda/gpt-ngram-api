@@ -209,38 +209,24 @@ def _parse_triplets_json(raw: str) -> List[CausalTriplet]:
         # Find JSON array
         json_match = re.search(r'\[[\s\S]*\]', raw)
         if not json_match:
+            # v59.1 FIX: Handle truncated JSON (max_tokens cut off mid-response)
+            # If response starts with '[' but no closing ']', try to salvage
+            if raw.strip().startswith('['):
+                # Find last complete object (ends with '}')
+                last_brace = raw.rfind('}')
+                if last_brace > 0:
+                    salvaged = raw[:last_brace + 1].rstrip().rstrip(',') + '\n]'
+                    try:
+                        data = json.loads(salvaged)
+                        logger.info(f"[CAUSAL_V2] Salvaged {len(data)} triplets from truncated JSON")
+                        return _triplets_from_data(data)
+                    except json.JSONDecodeError:
+                        pass
             logger.warning(f"[CAUSAL_V2] No JSON array in response: {raw[:200]}")
             return []
 
         data = json.loads(json_match.group())
-
-        valid_types = {"causes", "prevents", "requires", "enables", "leads_to",
-                       "may_cause", "results_from", "initiates", "treats"}
-
-        triplets = []
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            cause = str(item.get("cause", "")).strip()
-            effect = str(item.get("effect", "")).strip()
-            rel_type = str(item.get("type", "causes")).strip()
-            confidence = float(item.get("confidence", 0.7))
-
-            if not cause or not effect or len(cause) < 3 or len(effect) < 3:
-                continue
-
-            if rel_type not in valid_types:
-                rel_type = "causes"
-
-            triplets.append(CausalTriplet(
-                cause=cause[:80],
-                effect=effect[:80],
-                relation_type=rel_type,
-                confidence=min(0.95, max(0.3, confidence)),
-                source_sentence=f"{cause} -> {effect}",
-            ))
-
-        return triplets
+        return _triplets_from_data(data)
 
     except json.JSONDecodeError as e:
         logger.warning(f"[CAUSAL_V2] JSON parse error: {e}")
@@ -248,6 +234,37 @@ def _parse_triplets_json(raw: str) -> List[CausalTriplet]:
     except Exception as e:
         logger.error(f"[CAUSAL_V2] Parse error: {e}")
         return []
+
+
+def _triplets_from_data(data: list) -> List[CausalTriplet]:
+    """Convert parsed JSON data to CausalTriplet objects."""
+    valid_types = {"causes", "prevents", "requires", "enables", "leads_to",
+                   "may_cause", "results_from", "initiates", "treats"}
+
+    triplets = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        cause = str(item.get("cause", "")).strip()
+        effect = str(item.get("effect", "")).strip()
+        rel_type = str(item.get("type", "causes")).strip()
+        confidence = float(item.get("confidence", 0.7))
+
+        if not cause or not effect or len(cause) < 3 or len(effect) < 3:
+            continue
+
+        if rel_type not in valid_types:
+            rel_type = "causes"
+
+        triplets.append(CausalTriplet(
+            cause=cause[:80],
+            effect=effect[:80],
+            relation_type=rel_type,
+            confidence=min(0.95, max(0.3, confidence)),
+            source_sentence=f"{cause} -> {effect}",
+        ))
+
+    return triplets
 
 
 # ================================================================
