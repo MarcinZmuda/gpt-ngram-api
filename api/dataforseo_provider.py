@@ -94,6 +94,7 @@ def fetch_serp_data(keyword, num_results=10, location_code=2616, language_code="
 
         if resp.status_code != 200:
             print(f"[DataForSEO] ❌ HTTP {resp.status_code}: {resp.text[:300]}")
+            empty_result["_error"] = f"http_{resp.status_code}"
             return empty_result
 
         data = resp.json()
@@ -103,6 +104,7 @@ def fetch_serp_data(keyword, num_results=10, location_code=2616, language_code="
         if status_code != 20000:
             msg = data.get("status_message", "unknown")
             print(f"[DataForSEO] ❌ API error {status_code}: {msg}")
+            empty_result["_error"] = f"api_{status_code}"
             return empty_result
 
         tasks = data.get("tasks", [])
@@ -377,17 +379,20 @@ def fetch_raw_debug(keyword, location_code=2616, language_code="pl"):
         }
     ]
 
-    resp = requests.post(
-        "https://api.dataforseo.com/v3/serp/google/organic/live/advanced",
-        headers={
-            "Authorization": _DATAFORSEO_AUTH,
-            "Content-Type": "application/json",
-        },
-        data=json.dumps(payload),
-        timeout=30,
-    )
-
-    raw = resp.json()
+    try:
+        resp = requests.post(
+            "https://api.dataforseo.com/v3/serp/google/organic/live/advanced",
+            headers={
+                "Authorization": _DATAFORSEO_AUTH,
+                "Content-Type": "application/json",
+            },
+            data=json.dumps(payload),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+    except Exception as e:
+        return {"error": f"DataForSEO request failed: {type(e).__name__}", "keyword": keyword}
 
     # Extract diagnostic info
     tasks = raw.get("tasks", [])
