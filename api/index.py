@@ -702,8 +702,8 @@ def fetch_serp_sources(keyword, num_results=10):
                 return empty_result
             serp_metadata = dataforseo_fetch(keyword, num_results=num_results)
             provider_used = "dataforseo"
-            # v56.2: Detect auth failure
-            if not serp_metadata.get("organic_results_raw") and not serp_metadata.get("organic_results"):
+            # v68 H5: Only mark auth failure on actual API errors, not empty niche results
+            if serp_metadata.get("_error"):
                 _mark_dataforseo_auth_failed()
 
         elif SERP_PROVIDER == "serpapi":
@@ -718,11 +718,14 @@ def fetch_serp_sources(keyword, num_results=10):
                 print(f"[S1] 🔄 Auto-mode: trying DataForSEO first...")
                 serp_metadata = dataforseo_fetch(keyword, num_results=num_results)
                 provider_used = "dataforseo"
-                # Check if DataForSEO returned useful data
-                has_organic = bool(serp_metadata.get("organic_results_raw"))
-                if not has_organic:
-                    print(f"[S1] ⚠️ DataForSEO returned no organic results, falling back to SerpAPI...")
+                # v68 H5: Only fallback on actual errors, not empty niche results
+                if serp_metadata.get("_error"):
+                    print(f"[S1] ⚠️ DataForSEO error ({serp_metadata['_error']}), falling back to SerpAPI...")
                     _mark_dataforseo_auth_failed()
+                    serp_metadata = None
+                    provider_used = None
+                elif not serp_metadata.get("organic_results_raw"):
+                    print(f"[S1] ⚠️ DataForSEO: no organic results (niche keyword?), falling back to SerpAPI...")
                     serp_metadata = None
                     provider_used = None
 
@@ -1464,11 +1467,12 @@ def perform_s1_analysis():
 
 # ======================================================
 # v54.0: GET /api/debug/serpapi?keyword=...
-# Diagnostyczny endpoint — zwraca surowy JSON z SerpAPI
-# żeby zobaczyć co dokładnie przychodzi (PAA, AI Overview, etc.)
+# v68 H9: Only available when DEBUG_MODE=true
 # ======================================================
 @app.route("/api/debug/serpapi", methods=["GET"])
 def debug_serpapi():
+    if os.getenv("DEBUG_MODE", "").lower() != "true":
+        return jsonify({"error": "Debug endpoints disabled in production"}), 403
     keyword = request.args.get("keyword", "")
     if not keyword:
         return jsonify({"error": "Podaj ?keyword=..."}), 400
@@ -1516,12 +1520,12 @@ def debug_serpapi():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ======================================================
 # v55.0: GET /api/debug/dataforseo?keyword=...
-# Diagnostyczny endpoint — zwraca surowy JSON z DataForSEO
-# ======================================================
+# v68 H9: Only available when DEBUG_MODE=true
 @app.route("/api/debug/dataforseo", methods=["GET"])
 def debug_dataforseo():
+    if os.getenv("DEBUG_MODE", "").lower() != "true":
+        return jsonify({"error": "Debug endpoints disabled in production"}), 403
     keyword = request.args.get("keyword", "")
     if not keyword:
         return jsonify({"error": "Podaj ?keyword=..."}), 400
@@ -1555,28 +1559,31 @@ def perform_generate_compliance_report():
 
 # ======================================================
 # v53.0: Global JSON Error Handlers
-# NIGDY nie zwracaj HTML error pages — ZAWSZE Content-Type: application/json
+# v68 H10: Never leak exception details to clients
 # ======================================================
 @app.errorhandler(400)
 def handle_400(e):
-    return jsonify({"error": "Bad Request", "details": str(e)}), 400
+    return jsonify({"error": "Bad Request"}), 400
 
 @app.errorhandler(404)
 def handle_404(e):
-    return jsonify({"error": "Not Found", "details": str(e)}), 404
+    return jsonify({"error": "Not Found"}), 404
 
 @app.errorhandler(405)
 def handle_405(e):
-    return jsonify({"error": "Method Not Allowed", "details": str(e)}), 405
+    return jsonify({"error": "Method Not Allowed"}), 405
 
 @app.errorhandler(500)
 def handle_500(e):
-    return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+    print(f"[ERROR] 500: {e}")
+    return jsonify({"error": "Internal Server Error"}), 500
 
 @app.errorhandler(Exception)
 def handle_exception(e):
     print(f"[ERROR] Unhandled exception: {e}")
-    return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+    import traceback
+    traceback.print_exc()
+    return jsonify({"error": "Internal Server Error"}), 500
 
 
 @app.route("/health", methods=["GET"])
