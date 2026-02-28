@@ -603,7 +603,7 @@ def perform_entity_seo_analysis(
     print(f"[ENTITY] ✅ Found {len(relationships)} relationships")
     
     # 4️⃣ Pokrycie tematyczne
-    h2_list = h2_patterns or []
+    h2_list = list(h2_patterns) if h2_patterns else []
     for src in sources:
         h2_list.extend(src.get("h2_structure", []))
     
