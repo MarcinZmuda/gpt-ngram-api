@@ -1100,8 +1100,9 @@ def perform_ngram_analysis():
                 if isinstance(h2_item, str):
                     h2_patterns.append({"text": h2_item, "source_idx": src_idx})
                 elif isinstance(h2_item, dict):
-                    h2_item["source_idx"] = src_idx
-                    h2_patterns.append(h2_item)
+                    h2_copy = dict(h2_item)  # v68 M13: don't mutate caller's dict
+                    h2_copy["source_idx"] = src_idx
+                    h2_patterns.append(h2_copy)
         raw_toks, lem_toks = _lemmatize_tokens(content)
         _build_ngrams_for_source(raw_toks, lem_toks, src.get("url", f"src_{src_idx}"), src_idx)
 
@@ -1178,7 +1179,7 @@ def perform_ngram_analysis():
             freq_min = non_zero[0]
             freq_max = non_zero[-1]
             mid = len(non_zero) // 2
-            freq_median = non_zero[mid] if len(non_zero) % 2 == 1 else (non_zero[mid-1] + non_zero[mid]) // 2
+            freq_median = non_zero[mid] if len(non_zero) % 2 == 1 else (non_zero[mid-1] + non_zero[mid]) / 2
         else:
             freq_min = freq_median = freq_max = 0
 
@@ -1259,7 +1260,7 @@ def perform_ngram_analysis():
         avg_word_count = int(sum(word_counts) / len(word_counts))
         median_idx = len(word_counts) // 2
         sorted_wc = sorted(word_counts)
-        median_word_count = sorted_wc[median_idx] if len(sorted_wc) % 2 == 1 else (sorted_wc[median_idx - 1] + sorted_wc[median_idx]) // 2
+        median_word_count = sorted_wc[median_idx] if len(sorted_wc) % 2 == 1 else (sorted_wc[median_idx - 1] + sorted_wc[median_idx]) / 2
         recommended_length = int(avg_word_count * 1.1)  # 10% więcej niż średnia
     else:
         avg_word_count = 0
