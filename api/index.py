@@ -57,9 +57,18 @@ except ImportError:
 if DATAFORSEO_ENABLED:
     print("[S1] ✅ DataForSEO provider available")
 
-# v56.2: Runtime flag — set to True when DataForSEO returns auth error (40100)
-# Prevents futile retry as secondary provider in the same session
-_DATAFORSEO_AUTH_FAILED = False
+# v56.2 + v68 C5: Runtime cooldown — set when DataForSEO returns auth/empty error
+# Resets after 5 minutes to allow recovery (was permanent before, race condition)
+import time as _time_module
+_DATAFORSEO_AUTH_FAILED_UNTIL = 0  # timestamp — 0 means not failed
+
+def _is_dataforseo_auth_failed():
+    return _time_module.time() < _DATAFORSEO_AUTH_FAILED_UNTIL
+
+def _mark_dataforseo_auth_failed(cooldown_seconds=300):
+    global _DATAFORSEO_AUTH_FAILED_UNTIL
+    _DATAFORSEO_AUTH_FAILED_UNTIL = _time_module.time() + cooldown_seconds
+    print(f"[S1] ⚠️ DataForSEO disabled for {cooldown_seconds}s (until {_DATAFORSEO_AUTH_FAILED_UNTIL})")
 
 # SERP_PROVIDER: "dataforseo", "serpapi", or "auto" (default)
 # "auto" = use DataForSEO if configured, fallback to SerpAPI
@@ -128,6 +137,26 @@ except ImportError:
     print("[S1] ℹ️ Gap Analyzer not available")
 
 app = Flask(__name__)
+
+# ======================================================
+# 🔒 v68 C6: API Key Authentication
+# ======================================================
+import hmac as _hmac
+NGRAM_API_KEY = os.getenv("NGRAM_API_KEY") or None  # None = dev mode (no auth)
+
+@app.before_request
+def _require_api_key():
+    """Enforce Bearer token auth on /api/ endpoints (except health)."""
+    if NGRAM_API_KEY is None:
+        return  # No key configured — dev mode
+    if request.path in ("/health", "/"):
+        return
+    if not request.path.startswith("/api/"):
+        return
+    auth = request.headers.get("Authorization", "")
+    token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+    if not token or not _hmac.compare_digest(token, NGRAM_API_KEY):
+        return jsonify({"error": "Unauthorized"}), 401
 
 # ======================================================
 # 🧩 Load spaCy model (preinstalled lightweight version)
@@ -667,17 +696,15 @@ def fetch_serp_sources(keyword, num_results=10):
     serp_metadata = None
 
     try:
-        global _DATAFORSEO_AUTH_FAILED
-
         if SERP_PROVIDER == "dataforseo":
-            if not DATAFORSEO_ENABLED or _DATAFORSEO_AUTH_FAILED:
-                print("[S1] ❌ SERP_PROVIDER=dataforseo but DataForSEO not configured or auth failed")
+            if not DATAFORSEO_ENABLED or _is_dataforseo_auth_failed():
+                print("[S1] ❌ SERP_PROVIDER=dataforseo but DataForSEO not configured or auth cooldown")
                 return empty_result
             serp_metadata = dataforseo_fetch(keyword, num_results=num_results)
             provider_used = "dataforseo"
             # v56.2: Detect auth failure
             if not serp_metadata.get("organic_results_raw") and not serp_metadata.get("organic_results"):
-                _DATAFORSEO_AUTH_FAILED = True
+                _mark_dataforseo_auth_failed()
 
         elif SERP_PROVIDER == "serpapi":
             if not SERPAPI_KEY:
@@ -687,7 +714,7 @@ def fetch_serp_sources(keyword, num_results=10):
             provider_used = "serpapi"
 
         else:  # "auto" — try DataForSEO first, fallback to SerpAPI
-            if DATAFORSEO_ENABLED and not _DATAFORSEO_AUTH_FAILED:
+            if DATAFORSEO_ENABLED and not _is_dataforseo_auth_failed():
                 print(f"[S1] 🔄 Auto-mode: trying DataForSEO first...")
                 serp_metadata = dataforseo_fetch(keyword, num_results=num_results)
                 provider_used = "dataforseo"
@@ -695,7 +722,7 @@ def fetch_serp_sources(keyword, num_results=10):
                 has_organic = bool(serp_metadata.get("organic_results_raw"))
                 if not has_organic:
                     print(f"[S1] ⚠️ DataForSEO returned no organic results, falling back to SerpAPI...")
-                    _DATAFORSEO_AUTH_FAILED = True
+                    _mark_dataforseo_auth_failed()
                     serp_metadata = None
                     provider_used = None
 
@@ -742,7 +769,7 @@ def fetch_serp_sources(keyword, num_results=10):
             # v57.1: Don't skip DataForSEO for PAA cascade — empty organic
             # results ≠ auth failure. DataForSEO may still return PAA even
             # when organic results are sparse for niche queries.
-            if _secondary_name == "dataforseo" and _DATAFORSEO_AUTH_FAILED:
+            if _secondary_name == "dataforseo" and _is_dataforseo_auth_failed():
                 if "PAA" in _missing:
                     print(f"[S1] 🔄 DataForSEO auth failed for organic, but trying for PAA anyway...")
                 else:
