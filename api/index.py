@@ -1459,9 +1459,6 @@ def perform_ngram_analysis():
             }, merge=True)
             response_payload["saved_to_firestore"] = True
             print(f"[S1] ✅ Wyniki n-gramów zapisane do Firestore → {project_id}")
-            else:
-                response_payload["saved_to_firestore"] = False
-                print(f"[S1] ⚠️ Nie znaleziono projektu {project_id}")
         except Exception as e:
             print(f"[S1] ❌ Firestore error: {e}")
             response_payload["firestore_error"] = str(e)
