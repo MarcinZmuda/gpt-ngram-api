@@ -852,6 +852,17 @@ def fetch_serp_sources(keyword, num_results=10):
             title = item.get("title", "")
             if not url:
                 return None
+            # v68 M35: SSRF protection — only allow http(s), block private/internal
+            if not url.startswith(("http://", "https://")):
+                return None
+            try:
+                from urllib.parse import urlparse
+                _host = urlparse(url).hostname or ""
+                if _host in ("localhost", "127.0.0.1", "0.0.0.0", "metadata.google.internal") or _host.startswith("10.") or _host.startswith("172.") or _host.startswith("192.168.") or _host.startswith("169.254.") or _host.endswith(".internal"):
+                    print(f"[S1] 🛡️ SSRF blocked: {url[:60]}")
+                    return None
+            except Exception:
+                return None
             if should_skip_url(url):
                 print(f"[S1] ⏭️ Skipping large doc pattern: {url[:50]}...")
                 return None
@@ -1435,19 +1446,19 @@ def perform_ngram_analysis():
         try:
             db = firestore.client()
             doc_ref = db.collection("seo_projects").document(project_id)
-            if doc_ref.get().exists:
-                avg_len = (
-                    sum(len(t.split()) for t in all_text_content) // len(all_text_content)
-                    if all_text_content else 0
-                )
-                doc_ref.update({
-                    "s1_data": response_payload,
-                    "lsi_enrichment": {"enabled": True, "count": len(semantic_keyphrases)},
-                    "avg_competitor_length": avg_len,
-                    "updated_at": firestore.SERVER_TIMESTAMP
-                })
-                response_payload["saved_to_firestore"] = True
-                print(f"[S1] ✅ Wyniki n-gramów zapisane do Firestore → {project_id}")
+            # v68 M34: Use set(merge=True) instead of read-then-update
+            avg_len = (
+                sum(len(t.split()) for t in all_text_content) // len(all_text_content)
+                if all_text_content else 0
+            )
+            doc_ref.set({
+                "s1_data": response_payload,
+                "lsi_enrichment": {"enabled": True, "count": len(semantic_keyphrases)},
+                "avg_competitor_length": avg_len,
+                "updated_at": firestore.SERVER_TIMESTAMP
+            }, merge=True)
+            response_payload["saved_to_firestore"] = True
+            print(f"[S1] ✅ Wyniki n-gramów zapisane do Firestore → {project_id}")
             else:
                 response_payload["saved_to_firestore"] = False
                 print(f"[S1] ⚠️ Nie znaleziono projektu {project_id}")
