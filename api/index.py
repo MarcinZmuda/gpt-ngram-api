@@ -57,18 +57,32 @@ except ImportError:
 if DATAFORSEO_ENABLED:
     print("[S1] ✅ DataForSEO provider available")
 
-# v56.2 + v68 C5: Runtime cooldown — set when DataForSEO returns auth/empty error
-# Resets after 5 minutes to allow recovery (was permanent before, race condition)
-import time as _time_module
-_DATAFORSEO_AUTH_FAILED_UNTIL = 0  # timestamp — 0 means not failed
+# v56.2: Runtime flag — set to True when DataForSEO returns auth error (40100)
+# C5 FIX: Added TTL — resets after 5 minutes to allow retry
+_DATAFORSEO_AUTH_FAILED = False
+_DATAFORSEO_AUTH_FAILED_AT = 0  # timestamp when flag was set
+_DATAFORSEO_AUTH_FAILED_TTL = 300  # 5 minutes
 
-def _is_dataforseo_auth_failed():
-    return _time_module.time() < _DATAFORSEO_AUTH_FAILED_UNTIL
+def _is_dataforseo_blocked():
+    """Check if DataForSEO is temporarily blocked. Resets after TTL."""
+    global _DATAFORSEO_AUTH_FAILED, _DATAFORSEO_AUTH_FAILED_AT
+    if not _DATAFORSEO_AUTH_FAILED:
+        return False
+    import time as _t
+    if _t.time() - _DATAFORSEO_AUTH_FAILED_AT > _DATAFORSEO_AUTH_FAILED_TTL:
+        _DATAFORSEO_AUTH_FAILED = False
+        _DATAFORSEO_AUTH_FAILED_AT = 0
+        print("[S1] 🔄 DataForSEO block expired — retrying on next request")
+        return False
+    return True
 
-def _mark_dataforseo_auth_failed(cooldown_seconds=300):
-    global _DATAFORSEO_AUTH_FAILED_UNTIL
-    _DATAFORSEO_AUTH_FAILED_UNTIL = _time_module.time() + cooldown_seconds
-    print(f"[S1] ⚠️ DataForSEO disabled for {cooldown_seconds}s (until {_DATAFORSEO_AUTH_FAILED_UNTIL})")
+def _mark_dataforseo_failed():
+    """Mark DataForSEO as temporarily blocked."""
+    global _DATAFORSEO_AUTH_FAILED, _DATAFORSEO_AUTH_FAILED_AT
+    import time as _t
+    _DATAFORSEO_AUTH_FAILED = True
+    _DATAFORSEO_AUTH_FAILED_AT = _t.time()
+    print(f"[S1] ⚠️ DataForSEO blocked for {_DATAFORSEO_AUTH_FAILED_TTL}s")
 
 # SERP_PROVIDER: "dataforseo", "serpapi", or "auto" (default)
 # "auto" = use DataForSEO if configured, fallback to SerpAPI
@@ -139,23 +153,25 @@ except ImportError:
 app = Flask(__name__)
 
 # ======================================================
-# 🔒 v68 C6: API Key Authentication
+# 🔒 C6 FIX: API Key Authentication
 # ======================================================
 import hmac as _hmac
-NGRAM_API_KEY = os.getenv("NGRAM_API_KEY") or None  # None = dev mode (no auth)
+_NGRAM_API_KEY = os.getenv("NGRAM_API_KEY", os.getenv("MASTER_SEO_API_KEY", ""))
 
 @app.before_request
 def _require_api_key():
-    """Enforce Bearer token auth on /api/ endpoints (except health)."""
-    if NGRAM_API_KEY is None:
-        return  # No key configured — dev mode
-    if request.path in ("/health", "/"):
+    """Enforce Bearer token auth on all /api/ endpoints (except health)."""
+    if not _NGRAM_API_KEY:
+        if os.getenv("RENDER") is None:
+            return  # Local dev — no auth
+        return  # Production without key — allow (set NGRAM_API_KEY to enable)
+    if request.path in ("/api/health", "/health", "/"):
         return
     if not request.path.startswith("/api/"):
         return
     auth = request.headers.get("Authorization", "")
     token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
-    if not token or not _hmac.compare_digest(token, NGRAM_API_KEY):
+    if not token or not _hmac.compare_digest(token, _NGRAM_API_KEY):
         return jsonify({"error": "Unauthorized"}), 401
 
 # ======================================================
@@ -696,15 +712,16 @@ def fetch_serp_sources(keyword, num_results=10):
     serp_metadata = None
 
     try:
+
         if SERP_PROVIDER == "dataforseo":
-            if not DATAFORSEO_ENABLED or _is_dataforseo_auth_failed():
-                print("[S1] ❌ SERP_PROVIDER=dataforseo but DataForSEO not configured or auth cooldown")
+            if not DATAFORSEO_ENABLED or _is_dataforseo_blocked():
+                print("[S1] ❌ SERP_PROVIDER=dataforseo but DataForSEO not configured or auth failed")
                 return empty_result
             serp_metadata = dataforseo_fetch(keyword, num_results=num_results)
             provider_used = "dataforseo"
-            # v68 H5: Only mark auth failure on actual API errors, not empty niche results
-            if serp_metadata.get("_error"):
-                _mark_dataforseo_auth_failed()
+            # v56.2: Detect auth failure
+            if not serp_metadata.get("organic_results_raw") and not serp_metadata.get("organic_results"):
+                _mark_dataforseo_failed()
 
         elif SERP_PROVIDER == "serpapi":
             if not SERPAPI_KEY:
@@ -714,18 +731,15 @@ def fetch_serp_sources(keyword, num_results=10):
             provider_used = "serpapi"
 
         else:  # "auto" — try DataForSEO first, fallback to SerpAPI
-            if DATAFORSEO_ENABLED and not _is_dataforseo_auth_failed():
+            if DATAFORSEO_ENABLED and not _is_dataforseo_blocked():
                 print(f"[S1] 🔄 Auto-mode: trying DataForSEO first...")
                 serp_metadata = dataforseo_fetch(keyword, num_results=num_results)
                 provider_used = "dataforseo"
-                # v68 H5: Only fallback on actual errors, not empty niche results
-                if serp_metadata.get("_error"):
-                    print(f"[S1] ⚠️ DataForSEO error ({serp_metadata['_error']}), falling back to SerpAPI...")
-                    _mark_dataforseo_auth_failed()
-                    serp_metadata = None
-                    provider_used = None
-                elif not serp_metadata.get("organic_results_raw"):
-                    print(f"[S1] ⚠️ DataForSEO: no organic results (niche keyword?), falling back to SerpAPI...")
+                # Check if DataForSEO returned useful data
+                has_organic = bool(serp_metadata.get("organic_results_raw"))
+                if not has_organic:
+                    print(f"[S1] ⚠️ DataForSEO returned no organic results, falling back to SerpAPI...")
+                    _mark_dataforseo_failed()
                     serp_metadata = None
                     provider_used = None
 
@@ -772,7 +786,7 @@ def fetch_serp_sources(keyword, num_results=10):
             # v57.1: Don't skip DataForSEO for PAA cascade — empty organic
             # results ≠ auth failure. DataForSEO may still return PAA even
             # when organic results are sparse for niche queries.
-            if _secondary_name == "dataforseo" and _is_dataforseo_auth_failed():
+            if _secondary_name == "dataforseo" and _is_dataforseo_blocked():
                 if "PAA" in _missing:
                     print(f"[S1] 🔄 DataForSEO auth failed for organic, but trying for PAA anyway...")
                 else:
@@ -851,17 +865,6 @@ def fetch_serp_sources(keyword, num_results=10):
             url = item.get("link", "")
             title = item.get("title", "")
             if not url:
-                return None
-            # v68 M35: SSRF protection — only allow http(s), block private/internal
-            if not url.startswith(("http://", "https://")):
-                return None
-            try:
-                from urllib.parse import urlparse
-                _host = urlparse(url).hostname or ""
-                if _host in ("localhost", "127.0.0.1", "0.0.0.0", "metadata.google.internal") or _host.startswith("10.") or _host.startswith("172.") or _host.startswith("192.168.") or _host.startswith("169.254.") or _host.endswith(".internal"):
-                    print(f"[S1] 🛡️ SSRF blocked: {url[:60]}")
-                    return None
-            except Exception:
                 return None
             if should_skip_url(url):
                 print(f"[S1] ⏭️ Skipping large doc pattern: {url[:50]}...")
@@ -1111,9 +1114,8 @@ def perform_ngram_analysis():
                 if isinstance(h2_item, str):
                     h2_patterns.append({"text": h2_item, "source_idx": src_idx})
                 elif isinstance(h2_item, dict):
-                    h2_copy = dict(h2_item)  # v68 M13: don't mutate caller's dict
-                    h2_copy["source_idx"] = src_idx
-                    h2_patterns.append(h2_copy)
+                    h2_item["source_idx"] = src_idx
+                    h2_patterns.append(h2_item)
         raw_toks, lem_toks = _lemmatize_tokens(content)
         _build_ngrams_for_source(raw_toks, lem_toks, src.get("url", f"src_{src_idx}"), src_idx)
 
@@ -1190,7 +1192,7 @@ def perform_ngram_analysis():
             freq_min = non_zero[0]
             freq_max = non_zero[-1]
             mid = len(non_zero) // 2
-            freq_median = non_zero[mid] if len(non_zero) % 2 == 1 else (non_zero[mid-1] + non_zero[mid]) / 2
+            freq_median = non_zero[mid] if len(non_zero) % 2 == 1 else (non_zero[mid-1] + non_zero[mid]) // 2
         else:
             freq_min = freq_median = freq_max = 0
 
@@ -1271,7 +1273,7 @@ def perform_ngram_analysis():
         avg_word_count = int(sum(word_counts) / len(word_counts))
         median_idx = len(word_counts) // 2
         sorted_wc = sorted(word_counts)
-        median_word_count = sorted_wc[median_idx] if len(sorted_wc) % 2 == 1 else (sorted_wc[median_idx - 1] + sorted_wc[median_idx]) / 2
+        median_word_count = sorted_wc[median_idx] if len(sorted_wc) % 2 == 1 else (sorted_wc[median_idx - 1] + sorted_wc[median_idx]) // 2
         recommended_length = int(avg_word_count * 1.1)  # 10% więcej niż średnia
     else:
         avg_word_count = 0
@@ -1446,19 +1448,22 @@ def perform_ngram_analysis():
         try:
             db = firestore.client()
             doc_ref = db.collection("seo_projects").document(project_id)
-            # v68 M34: Use set(merge=True) instead of read-then-update
-            avg_len = (
-                sum(len(t.split()) for t in all_text_content) // len(all_text_content)
-                if all_text_content else 0
-            )
-            doc_ref.set({
-                "s1_data": response_payload,
-                "lsi_enrichment": {"enabled": True, "count": len(semantic_keyphrases)},
-                "avg_competitor_length": avg_len,
-                "updated_at": firestore.SERVER_TIMESTAMP
-            }, merge=True)
-            response_payload["saved_to_firestore"] = True
-            print(f"[S1] ✅ Wyniki n-gramów zapisane do Firestore → {project_id}")
+            if doc_ref.get().exists:
+                avg_len = (
+                    sum(len(t.split()) for t in all_text_content) // len(all_text_content)
+                    if all_text_content else 0
+                )
+                doc_ref.update({
+                    "s1_data": response_payload,
+                    "lsi_enrichment": {"enabled": True, "count": len(semantic_keyphrases)},
+                    "avg_competitor_length": avg_len,
+                    "updated_at": firestore.SERVER_TIMESTAMP
+                })
+                response_payload["saved_to_firestore"] = True
+                print(f"[S1] ✅ Wyniki n-gramów zapisane do Firestore → {project_id}")
+            else:
+                response_payload["saved_to_firestore"] = False
+                print(f"[S1] ⚠️ Nie znaleziono projektu {project_id}")
         except Exception as e:
             print(f"[S1] ❌ Firestore error: {e}")
             response_payload["firestore_error"] = str(e)
@@ -1476,12 +1481,11 @@ def perform_s1_analysis():
 
 # ======================================================
 # v54.0: GET /api/debug/serpapi?keyword=...
-# v68 H9: Only available when DEBUG_MODE=true
+# Diagnostyczny endpoint — zwraca surowy JSON z SerpAPI
+# żeby zobaczyć co dokładnie przychodzi (PAA, AI Overview, etc.)
 # ======================================================
 @app.route("/api/debug/serpapi", methods=["GET"])
 def debug_serpapi():
-    if os.getenv("DEBUG_MODE", "").lower() != "true":
-        return jsonify({"error": "Debug endpoints disabled in production"}), 403
     keyword = request.args.get("keyword", "")
     if not keyword:
         return jsonify({"error": "Podaj ?keyword=..."}), 400
@@ -1529,12 +1533,12 @@ def debug_serpapi():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ======================================================
 # v55.0: GET /api/debug/dataforseo?keyword=...
-# v68 H9: Only available when DEBUG_MODE=true
+# Diagnostyczny endpoint — zwraca surowy JSON z DataForSEO
+# ======================================================
 @app.route("/api/debug/dataforseo", methods=["GET"])
 def debug_dataforseo():
-    if os.getenv("DEBUG_MODE", "").lower() != "true":
-        return jsonify({"error": "Debug endpoints disabled in production"}), 403
     keyword = request.args.get("keyword", "")
     if not keyword:
         return jsonify({"error": "Podaj ?keyword=..."}), 400
@@ -1568,31 +1572,28 @@ def perform_generate_compliance_report():
 
 # ======================================================
 # v53.0: Global JSON Error Handlers
-# v68 H10: Never leak exception details to clients
+# NIGDY nie zwracaj HTML error pages — ZAWSZE Content-Type: application/json
 # ======================================================
 @app.errorhandler(400)
 def handle_400(e):
-    return jsonify({"error": "Bad Request"}), 400
+    return jsonify({"error": "Bad Request", "details": str(e)}), 400
 
 @app.errorhandler(404)
 def handle_404(e):
-    return jsonify({"error": "Not Found"}), 404
+    return jsonify({"error": "Not Found", "details": str(e)}), 404
 
 @app.errorhandler(405)
 def handle_405(e):
-    return jsonify({"error": "Method Not Allowed"}), 405
+    return jsonify({"error": "Method Not Allowed", "details": str(e)}), 405
 
 @app.errorhandler(500)
 def handle_500(e):
-    print(f"[ERROR] 500: {e}")
-    return jsonify({"error": "Internal Server Error"}), 500
+    return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
 
 @app.errorhandler(Exception)
 def handle_exception(e):
     print(f"[ERROR] Unhandled exception: {e}")
-    import traceback
-    traceback.print_exc()
-    return jsonify({"error": "Internal Server Error"}), 500
+    return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
 
 
 @app.route("/health", methods=["GET"])
